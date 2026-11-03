@@ -1,0 +1,165 @@
+import { describe, expect, it, vi } from 'vitest';
+import { useAIConfigStore } from './aiConfigStore';
+import { webgpuClient, WebGPUClient } from '../utils/webgpuClient';
+
+describe('AI preferences migration', () => {
+  it('defaults new visitors to Haiku 5.5, the recommended model', () => {
+    // jsdom serves from localhost, the local companion host.
+    expect(useAIConfigStore.getInitialState().llmBackend).toBe('haiku');
+  });
+
+  it('removes a legacy Gemini key and falls back to heuristic on a cloud backend', () => {
+    const migrate = useAIConfigStore.persist.getOptions().migrate;
+    expect(migrate).toBeDefined();
+    const result = migrate!(
+      {
+        aiMode: 'gemini',
+        llmBackend: 'gemini',
+        geminiApiKey: 'legacy-secret',
+      },
+      0
+    );
+    expect(result).toEqual({ aiMode: 'heuristic', llmBackend: 'haiku' });
+    expect(JSON.stringify(result)).not.toContain('legacy-secret');
+  });
+
+  it('persists only safe preferences and keeps the selected WebGPU mode', () => {
+    const options = useAIConfigStore.persist.getOptions();
+    const local = options.migrate!(
+      { aiMode: 'hybrid', llmBackend: 'webgpu', geminiApiKey: 'secret' },
+      0
+    );
+    expect(local).toEqual({ aiMode: 'hybrid', llmBackend: 'webgpu' });
+    useAIConfigStore.setState({ aiMode: 'gemini', llmBackend: 'luna' });
+    const saved = options.partialize!(useAIConfigStore.getState());
+    expect(saved).toEqual({ aiMode: 'heuristic', llmBackend: 'luna' });
+    expect(JSON.stringify(saved)).not.toMatch(/secret|key|connectedProviders/);
+  });
+
+  it('migrates public direct-provider preferences to OpenRouter without credentials', () => {
+    const originalWindow = window;
+    vi.stubGlobal('window', { location: { hostname: 'www.millos.net' } });
+    try {
+      const migrate = useAIConfigStore.persist.getOptions().migrate!;
+      expect(migrate({ llmBackend: 'haiku', aiMode: 'hybrid' }, 1)).toEqual({
+        llmBackend: 'openrouter-haiku',
+        aiMode: 'heuristic',
+      });
+      expect(migrate({ llmBackend: 'luna', aiMode: 'hybrid' }, 1)).toEqual({
+        llmBackend: 'openrouter-luna',
+        aiMode: 'heuristic',
+      });
+      expect(migrate({ llmBackend: 'sol' }, 2)).toMatchObject({ llmBackend: 'openrouter-sol' });
+      expect(migrate({ llmBackend: 'gemini' }, 2)).toMatchObject({
+        llmBackend: 'openrouter-gemini',
+      });
+      expect(migrate({ llmBackend: 'openrouter-gemini' }, 2)).toMatchObject({
+        llmBackend: 'openrouter-gemini',
+      });
+      expect(migrate({ llmBackend: 'not-a-backend' }, 2)).toMatchObject({
+        llmBackend: 'openrouter-haiku',
+      });
+    } finally {
+      vi.stubGlobal('window', originalWindow);
+    }
+  });
+
+  it('rewrites a real version-zero persisted record without the legacy key', async () => {
+    const originalStorage = useAIConfigStore.persist.getOptions().storage;
+    let stored = {
+      state: { aiMode: 'gemini', llmBackend: 'gemini', geminiApiKey: 'legacy-secret' },
+      version: 0,
+    } as { state: Record<string, unknown>; version: number };
+    useAIConfigStore.persist.setOptions({
+      storage: {
+        getItem: () => stored,
+        setItem: (_name, value) => {
+          stored = value as typeof stored;
+        },
+        removeItem: () => {},
+      },
+    });
+    try {
+      await useAIConfigStore.persist.rehydrate();
+      expect(stored.version).toBe(2);
+      expect(stored.state).toEqual({ aiMode: 'heuristic', llmBackend: 'haiku' });
+      expect(JSON.stringify(stored)).not.toContain('legacy-secret');
+    } finally {
+      useAIConfigStore.persist.setOptions({ storage: originalStorage });
+    }
+  });
+});
+
+describe('local model cache', () => {
+  it('deletes every shipped model, including Qwen3-4B left from before the switch', async () => {
+    vi.spyOn(webgpuClient, 'disconnect').mockResolvedValue();
+    const deleted = vi.spyOn(WebGPUClient, 'deleteModelCache').mockResolvedValue();
+    try {
+      await useAIConfigStore.getState().deleteWebGPUCache();
+      expect(deleted.mock.calls.map(([id]) => id).sort()).toEqual(
+        ['Qwen3-4B-q4f16_1-MLC', 'Qwen3.5-4B-q4f16_1-MLC'].sort()
+      );
+      expect(useAIConfigStore.getState().webgpuModelReady).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+describe('a lost WebGPU device', () => {
+  it('reloads the local core once, and leaves a second loss soon after to the player', async () => {
+    const load = vi.fn().mockResolvedValue(true);
+    const original = useAIConfigStore.getState().loadWebGPUModel;
+    useAIConfigStore.setState({
+      loadWebGPUModel: load,
+      webgpuModelReady: true,
+      webgpuStatus: 'ready',
+    });
+    // A loaded engine whose model is gone: its next request fails as not loaded.
+    const engine = {
+      interruptGenerate: () => undefined,
+      unload: async () => undefined,
+      chat: {
+        completions: {
+          create: () =>
+            Promise.reject(
+              new Error('Model not loaded before trying to complete ChatCompletionRequest.')
+            ),
+        },
+      },
+    };
+    const lose = async () => {
+      Object.assign(webgpuClient as unknown as Record<string, unknown>, {
+        engine,
+        fastLaneId: 'lane',
+        circuitBreaker: { failures: 0, lastFailure: 0, isOpen: false },
+      });
+      await webgpuClient.generateContent('Plant telemetry.');
+    };
+    try {
+      await lose();
+      expect(useAIConfigStore.getState()).toMatchObject({
+        webgpuModelReady: false,
+        webgpuStatus: 'idle',
+        webgpuError: null,
+      });
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(load).toHaveBeenCalledWith(false);
+
+      useAIConfigStore.setState({ webgpuModelReady: true, webgpuStatus: 'ready' });
+      await lose();
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(useAIConfigStore.getState()).toMatchObject({
+        webgpuModelReady: false,
+        webgpuStatus: 'error',
+      });
+      expect(useAIConfigStore.getState().webgpuError).toMatch(/again/);
+    } finally {
+      useAIConfigStore.setState({
+        loadWebGPUModel: original,
+        webgpuError: null,
+        webgpuStatus: 'idle',
+      });
+    }
+  });
+});

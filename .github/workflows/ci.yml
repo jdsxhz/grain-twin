@@ -1,0 +1,247 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Check TypeScript
+        run: npm run typecheck --if-present || npx tsc --noEmit
+
+      - name: Check formatting
+        run: npm run format:check
+
+      # Static contract gates that need no build or browser. They exist locally
+      # and were never run in CI, so drift only surfaced on a developer machine.
+      - name: Validate depth policy
+        run: npm run validate:depth
+
+      - name: Validate shader contracts
+        run: npm run validate:shaders
+
+      - name: Typecheck agent plane
+        run: npm run agent:typecheck
+
+      - name: Generate and check agent manifest
+        run: npm run agent:manifest && npm run agent:manifest:check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --coverage --reporter=verbose
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v6
+        if: success()
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
+
+  build-assembly:
+    name: Build Assembly
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    outputs:
+      dist-sha256: ${{ steps.dist-checksum.outputs.sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: VERSION="v$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")" npm run build
+
+      # Both read dist/ and src/ only; neither needs a GPU or a browser.
+      - name: Validate bundle budget
+        run: npm run validate:bundle
+
+      - name: Validate module reachability
+        run: npm run validate:reachability
+
+      - name: Record built assembly checksum
+        id: dist-checksum
+        run: |
+          digest=$(node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          const files = readdirSync('dist', { recursive: true }).sort()
+            .filter((file) => statSync(`dist/${file}`).isFile());
+          const entries = files.map((file) => [file,
+            createHash('sha256').update(readFileSync(`dist/${file}`)).digest('hex')]);
+          console.log(createHash('sha256').update(JSON.stringify(entries)).digest('hex'));
+          NODE
+          )
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          include-hidden-files: true
+          retention-days: 7
+
+  build:
+    # Preserve the Build check identity: it is green only after UI acceptance.
+    name: Build
+    runs-on: macos-26
+    needs: build-assembly
+    timeout-minutes: 15
+    env:
+      MILLOS_CI_DIST_SHA256: ${{ needs.build-assembly.outputs.dist-sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download the Linux-built assembly from this workflow run
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Verify built assembly checksum
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          const files = readdirSync('dist', { recursive: true }).sort()
+            .filter((file) => statSync(`dist/${file}`).isFile());
+          const entries = files.map((file) => [file,
+            createHash('sha256').update(readFileSync(`dist/${file}`)).digest('hex')]);
+          const digest = createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+          assert.equal(digest, process.env.MILLOS_CI_DIST_SHA256);
+          console.log(`Verified Linux-built assembly: ${digest}`);
+          NODE
+
+      - name: Install pinned Chromium for Jev UI acceptance
+        # Playwright 1.62.1 pins full Chromium151. Compare the newer backend on
+        # this same hosted Metal path, retaining the original image/deadline.
+        # Working if the artifact records151 and the unchanged hardware gate passes.
+        run: npx playwright install --no-shell chromium
+
+      - name: Validate Jev personal-key flow in desktop and mobile layouts
+        id: jev-acceptance
+        timeout-minutes: 8
+        env:
+          DEBUG: pw:browser
+        # Standard public macOS VM, with no paid runner or desktop registration.
+        # Metal availability is tested, not inferred from the runner's CPU label.
+        # Working if actual Metal WebGL and both full-world UI flows pass sandboxed.
+        # Browser-only readback presentation avoids the VM's CoreAnimation path.
+        # Scene WebGL2 must still be out-of-process, sandboxed hardware Metal.
+        # One cold-start attribution: ordinary render CPU spans and disjoint-safe
+        # GPU queries, matched to the owned process's backend timeout messages.
+        # Instrumentation can perturb timing; unresolved queries prove no cause.
+        # Working if pass identity/timestamps reach the raw artifact and the
+        # original screenshot/deadline/exit status still decide this Build step.
+        run: |
+          set -o pipefail
+          mkdir -p test-results/jev-browser
+          # Native trace startup failed before navigation on the hosted VM.
+          # Keep that retained failure separate; it is not an application gate.
+          node scripts/validate-jev-browser.mjs --metal-renderer --software-compositor --backend-logging --cold-render-attribution \
+            2>&1 | tee test-results/jev-browser/backend-browser.log
+
+      # Run only after the actual world failed, preserving that failed check.
+      # Working if bare resize/target readback distinguishes a backend failure
+      # from an assembly interaction without providing substitute acceptance.
+      - name: Reduce failed Metal presentation to a bare default-buffer diagnostic
+        if: ${{ failure() && steps.jev-acceptance.conclusion == 'failure' }}
+        timeout-minutes: 2
+        run: node scripts/diagnose-metal-default-buffer.mjs --software-compositor
+
+      - name: Upload Jev browser evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jev-browser
+          path: test-results/jev-browser/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-proxy:
+    name: Build SCADA Proxy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scada-proxy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+          cache-dependency-path: scada-proxy/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test --if-present

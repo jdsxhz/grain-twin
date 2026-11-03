@@ -1,0 +1,243 @@
+/**
+ * Procedural Grass Texture Generator
+ *
+ * Creates stylized grass textures for outdoor areas.
+ * Uses multi-octave noise for natural, non-repetitive appearance.
+ */
+import * as THREE from 'three';
+import {
+  getTexture,
+  createColorDataTexture,
+  createLinearDataTexture,
+  fbmNoise,
+  hash,
+  smoothNoise,
+  blendTileEdges,
+} from '../utils/textureGenerator';
+
+export interface GrassOptions {
+  baseColor?: [number, number, number]; // Base grass color (R, G, B 0-1)
+  tipColor?: [number, number, number]; // Grass tip color (lighter)
+  density?: number; // Blade density (0-1)
+  variation?: number; // Color variation amount
+  seed?: number; // Random seed for variety
+}
+
+/**
+ * Generate a procedural grass texture with high variation
+ * Uses multiple noise scales to prevent visible tiling
+ */
+export const generateGrass = (
+  size: number = 512, // Larger default for better detail
+  options: GrassOptions = {}
+): THREE.DataTexture => {
+  const {
+    baseColor = [0.33, 0.42, 0.29], // Mixed meadow grasses
+    tipColor = [0.53, 0.56, 0.39], // Sun-dried blade tips
+    density = 0.7,
+    variation = 0.16,
+    seed = 42,
+  } = options;
+
+  const cacheKey = `grass-v7-${size}-${baseColor.join(',')}-${tipColor.join(',')}-${density}-${variation}-${seed}`;
+
+  return getTexture(cacheKey, () => {
+    const data = new Uint8Array(size * size * 4);
+
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        const u = x / size;
+        const v = y / size;
+
+        // Within-tile variation stays quiet: TerrainMaterial already adds
+        // non-tile-sized macro variation and warps the grass UVs.
+        // Very large scale
+        const megaScale = fbmNoise(u * 1.5 + seed, v * 1.5, 2) * 0.16;
+        // Large scale (major color regions)
+        const largeNoise = fbmNoise(u * 3.5 + seed * 0.1, v * 3.5, 3);
+        // Medium scale (grass clump variation)
+        const mediumNoise = fbmNoise(u * 8 + seed * 0.2, v * 8 + 10, 3);
+        // Fine scale (blade-level detail)
+        const fineNoise = fbmNoise(u * 25 + seed * 0.3, v * 25 + 20, 2);
+        // Micro detail (individual blade tips)
+        const microNoise = smoothNoise(x * 0.15, y * 0.15) * 0.5 + 0.5;
+
+        // === GRASS BLADE PATTERN ===
+        // Local clumps have no field-wide grain direction. The old u-only
+        // waves survived mipmapping as parallel mowing stripes across every lawn.
+        const bladePattern =
+          smoothNoise(u * 48 + mediumNoise * 3 + seed, v * 48 + fineNoise * 3) * 0.65 +
+          smoothNoise(u * 24 - seed, v * 24 + mediumNoise * 2) * 0.35;
+
+        // Tip gradient influenced by noise
+        const tipGradient = Math.pow(fineNoise * microNoise, 0.6);
+        const tipAmount = bladePattern * tipGradient * density;
+
+        // === BASE COLOR MIXING ===
+        let r = baseColor[0] + (tipColor[0] - baseColor[0]) * tipAmount;
+        let g = baseColor[1] + (tipColor[1] - baseColor[1]) * tipAmount;
+        let b = baseColor[2] + (tipColor[2] - baseColor[2]) * tipAmount;
+
+        // === LARGE SCALE VARIATION (prevents tiling) ===
+        const megaVar = (megaScale - 0.08) * 0.3;
+        r += megaVar * 0.4;
+        g += megaVar * 0.6;
+        b += megaVar * 0.2;
+
+        // === COLOR VARIATION ===
+        const colorVar = (largeNoise - 0.5) * variation;
+        r += colorVar * 0.6;
+        g += colorVar * 1.2;
+        b += colorVar * 0.4;
+
+        // === GRASS PATCHES (different grass types) ===
+        const patchNoise = fbmNoise(u * 5 + 50 + seed * 0.5, v * 5 + 50, 2);
+        if (patchNoise > 0.6) {
+          // Slightly yellower/drier patch
+          const patchAmount = (patchNoise - 0.6) * 1.5;
+          r += patchAmount * 0.08;
+          g += patchAmount * 0.04;
+          b -= patchAmount * 0.03;
+        } else if (patchNoise < 0.35) {
+          // Lusher, darker patch
+          const patchAmount = (0.35 - patchNoise) * 1.2;
+          r -= patchAmount * 0.04;
+          g += patchAmount * 0.03;
+          b -= patchAmount * 0.02;
+        }
+
+        // === SHADOW AND DEPTH ===
+        const shadowNoise = fbmNoise(u * 4 + 100 + seed, v * 4, 3);
+        if (shadowNoise < 0.4) {
+          const shadowAmount = (0.4 - shadowNoise) * 0.35;
+          r -= shadowAmount * 0.25;
+          g -= shadowAmount * 0.15;
+          b -= shadowAmount * 0.15;
+        }
+
+        // === DIRT SPOTS ===
+        const dirtHash = hash(Math.floor(u * 10 + seed), Math.floor(v * 10));
+        const dirtNoise = fbmNoise(u * 15 + seed * 2, v * 15, 2);
+        if (dirtHash > 0.88 && dirtNoise > 0.5) {
+          const dirtAmount = (dirtHash - 0.88) * 4 * (dirtNoise - 0.5) * 2;
+          r = r * (1 - dirtAmount) + 0.28 * dirtAmount;
+          g = g * (1 - dirtAmount) + 0.24 * dirtAmount;
+          b = b * (1 - dirtAmount) + 0.18 * dirtAmount;
+        }
+
+        // === MEDIUM SCALE DETAIL ===
+        r += (mediumNoise - 0.5) * 0.06;
+        g += (mediumNoise - 0.5) * 0.09;
+        b += (mediumNoise - 0.5) * 0.04;
+
+        // Soft clover clusters, rather than identical bright square stamps.
+        const cloverX = u * 30 + seed * 3;
+        const cloverY = v * 30;
+        const cloverNoise = hash(Math.floor(cloverX), Math.floor(cloverY));
+        if (cloverNoise > 0.95) {
+          const cluster =
+            1 -
+            THREE.MathUtils.smoothstep(
+              Math.hypot((cloverX % 1) - 0.5, (cloverY % 1) - 0.5),
+              0.12,
+              0.6
+            );
+          g += 0.025 * cluster;
+          r -= 0.012 * cluster;
+        }
+
+        data[i] = Math.floor(Math.max(0, Math.min(1, r)) * 255);
+        data[i + 1] = Math.floor(Math.max(0, Math.min(1, g)) * 255);
+        data[i + 2] = Math.floor(Math.max(0, Math.min(1, b)) * 255);
+        data[i + 3] = 255;
+      }
+    }
+
+    // Keep clumps and blades, but remove most tile-sized colour patches.
+    // Those broad patches survive mipmapping and repeat as a wavy checkerboard
+    // even with the terrain's continuous UV warp. The terrain already supplies
+    // non-tile-sized meadow variation. Bake this once; no extra shader tap.
+    // A cyclic separable box filter preserves the mean and avoids edge padding.
+    const radius = Math.max(1, Math.floor(size / 8));
+    const span = radius * 2 + 1;
+    const horizontal = new Float32Array(size * size * 3);
+    const means = [0, 0, 0];
+    for (let i = 0; i < data.length; i += 4) {
+      for (let c = 0; c < 3; c += 1) means[c] += data[i + c] / (size * size);
+    }
+    for (let y = 0; y < size; y += 1) {
+      for (let c = 0; c < 3; c += 1) {
+        let sum = 0;
+        for (let dx = -radius; dx <= radius; dx += 1) {
+          sum += data[(y * size + ((dx + size) % size)) * 4 + c];
+        }
+        for (let x = 0; x < size; x += 1) {
+          horizontal[(y * size + x) * 3 + c] = sum / span;
+          sum -= data[(y * size + ((x - radius + size) % size)) * 4 + c];
+          sum += data[(y * size + ((x + radius + 1) % size)) * 4 + c];
+        }
+      }
+    }
+    for (let x = 0; x < size; x += 1) {
+      for (let c = 0; c < 3; c += 1) {
+        let sum = 0;
+        for (let dy = -radius; dy <= radius; dy += 1) {
+          sum += horizontal[(((dy + size) % size) * size + x) * 3 + c];
+        }
+        for (let y = 0; y < size; y += 1) {
+          const i = (y * size + x) * 4 + c;
+          data[i] = Math.round(
+            THREE.MathUtils.clamp(data[i] + (means[c] - sum / span) * 0.9, 0, 255)
+          );
+          sum -= horizontal[(((y - radius + size) % size) * size + x) * 3 + c];
+          sum += horizontal[(((y + radius + 1) % size) * size + x) * 3 + c];
+        }
+      }
+    }
+
+    blendTileEdges(data, size);
+    return createColorDataTexture(data, size, size);
+  });
+};
+
+/**
+ * Generate grass roughness map with variation
+ * Grass is generally quite rough/matte with some variation
+ */
+export const generateGrassRoughness = (size: number = 512): THREE.DataTexture => {
+  return getTexture(`grass-roughness-v2-${size}`, () => {
+    const data = new Uint8Array(size * size * 4);
+
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        const u = x / size;
+        const v = y / size;
+
+        // Base high roughness
+        let roughness = 0.88;
+
+        // Multi-scale variation
+        const largeVar = fbmNoise(u * 3, v * 3, 2);
+        const medVar = fbmNoise(u * 12, v * 12, 2);
+        const fineVar = fbmNoise(u * 25, v * 25, 2);
+
+        roughness += (largeVar - 0.5) * 0.08;
+        roughness += (medVar - 0.5) * 0.06;
+        roughness += (fineVar - 0.5) * 0.04;
+
+        // Clamp
+        roughness = Math.max(0.72, Math.min(0.98, roughness));
+
+        const val = Math.floor(roughness * 255);
+        data[i] = val;
+        data[i + 1] = val;
+        data[i + 2] = val;
+        data[i + 3] = 255;
+      }
+    }
+
+    return createLinearDataTexture(data, size, size);
+  });
+};

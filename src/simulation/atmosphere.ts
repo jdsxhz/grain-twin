@@ -1,0 +1,325 @@
+import { toSimulationMinutes } from './simulationClock';
+
+export type AtmosphereWeather = 'clear' | 'cloudy' | 'rain' | 'storm';
+
+export interface AtmosphereState {
+  readonly simulationMinutes: number;
+  readonly solarAngle: number;
+  readonly solarElevation: number;
+  readonly daylight: number;
+  readonly twilight: number;
+  readonly cloudCoverage: number;
+  readonly lightMultiplier: number;
+  readonly wetness: number;
+  /** Active precipitation rate. Unlike wetness, this is zero for damp overcast weather. */
+  readonly precipitation: number;
+  readonly wind: number;
+  /**
+   * `THREE.FogExp2` density, replacing the previous `fogNear` / `fogFar` pair.
+   *
+   * Linear fog ramps between two distances and then CLAMPS at 1.0, so with the
+   * old clear-weather values (175 / 350) the site perimeter at radius 255 sat
+   * on a fog factor of 0.46 and everything past 350 on a flat 1.0: the middle
+   * distance converged to one blue-white wash and carried no depth at all.
+   * Exponential-squared fog asymptotes instead - 0.23 at that same 255 - so
+   * distant geometry keeps most of its own albedo and silhouettes separate.
+   * The falloff shape, the height term and the far-plane guard live in
+   * `shaders/atmosphericFog.ts`; this is only the weather's contribution.
+   */
+  readonly fogDensity: number;
+}
+
+export interface CelestialState {
+  sunDirection: [number, number, number];
+  moonDirection: [number, number, number];
+  sunOpacity: number;
+  moonOpacity: number;
+  /** The bright stars and planets: out from civil twilight. */
+  starOpacity: number;
+  /** The faint field: only once the sky is properly dark (below about -12 degrees). */
+  faintStarOpacity: number;
+  goldenHour: number;
+  sunLightIntensity: number;
+  moonLightIntensity: number;
+  ambientLightIntensity: number;
+}
+
+const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
+const smoothstep = (edge0: number, edge1: number, value: number): number => {
+  const t = clamp01((value - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+};
+
+/**
+ * How overcast the sky is, 0 for fair weather to 1 for a closed storm deck.
+ *
+ * Clear (0.20) is exactly 0, so nothing downstream of this moves in clear
+ * weather. Rain (0.74) is 0.71 and storm (0.90) is 1. Before this, weather only
+ * DIMMED the scene through `lightMultiplier`: the rain capture kept a visible
+ * sun disc, a blue sky and crisp full-strength shadows - a darker clear noon.
+ */
+export function getOvercastWeight(cloudCoverage: number): number {
+  return Number.isFinite(cloudCoverage) ? smoothstep(0.45, 0.9, cloudCoverage) : 0;
+}
+
+/**
+ * How closed the cloud deck is: 0 up to cloudy's 0.52 cover, 1 from 0.72, so
+ * rain (0.74) and storm (0.90) are a closed grey deck with no blue and no
+ * solar disc, and clear and cloudy skies are exactly unchanged. Below it,
+ * `getOvercastWeight` still greys and diffuses partial cloud by degree.
+ */
+export function getOvercastDeck(cloudCoverage: number): number {
+  return Number.isFinite(cloudCoverage) ? smoothstep(0.55, 0.72, cloudCoverage) : 0;
+}
+
+/**
+ * Share of the direct sun a cloud deck scatters into sky fill: exactly 0 in
+ * fair weather (overcast weight 0 at clear's 0.20 cover), 0.75 under rain and
+ * 0.92 under a storm deck.
+ *
+ * Rain used to scatter 0.6 of the overcast weight (0.43), keeping 57% of its
+ * key: noon rain still threw hard-edged shadows under the tanks and hard
+ * sunlit skylight patches across the hall floor (final4/final5-med-rain
+ * tank-farm, packing, interior, milling). A rain deck is a broad, diffuse
+ * source. The roof shadows the hall through the shadow map, so the key is
+ * moved into the fill rather than the shadow faded: fading it would light the
+ * floor under the roof.
+ */
+export function overcastKeyScatter(cloudCoverage: number): number {
+  return Math.min(0.92, 1.05 * getOvercastWeight(cloudCoverage));
+}
+
+/**
+ * The weather contribution, hoisted out of `sampleAtmosphere`.
+ *
+ * This table used to be an object literal *inside* the function, so every
+ * single call built the whole thing - one outer object plus four nested ones -
+ * and then read exactly one branch and threw the other four away. Five wasted
+ * allocations per call, on a function four `useFrame` callbacks invoke every
+ * frame. It is static data and never depended on the arguments; the only
+ * reason it was inline was proximity to its use.
+ */
+const WEATHER_PROFILES = {
+  clear: {
+    cloudCoverage: 0.2,
+    lightMultiplier: 1,
+    wetness: 0,
+    precipitation: 0,
+    wind: 0.2,
+    fogDensity: 0.002,
+  },
+  cloudy: {
+    cloudCoverage: 0.52,
+    lightMultiplier: 0.82,
+    wetness: 0.08,
+    precipitation: 0,
+    wind: 0.36,
+    fogDensity: 0.0027,
+  },
+  rain: {
+    cloudCoverage: 0.74,
+    lightMultiplier: 0.66,
+    wetness: 0.82,
+    precipitation: 0.62,
+    wind: 0.58,
+    fogDensity: 0.0039,
+  },
+  storm: {
+    cloudCoverage: 0.9,
+    lightMultiplier: 0.42,
+    wetness: 1,
+    precipitation: 1,
+    wind: 0.92,
+    fogDensity: 0.0054,
+  },
+} as const satisfies Record<
+  AtmosphereWeather,
+  Pick<
+    AtmosphereState,
+    'cloudCoverage' | 'lightMultiplier' | 'wetness' | 'precipitation' | 'wind' | 'fogDensity'
+  >
+>;
+
+/**
+ * Writable view of `AtmosphereState`, for reusable scratch buffers.
+ * `AtmosphereState` itself stays fully `readonly` for consumers.
+ */
+export type MutableAtmosphereState = {
+  -readonly [K in keyof AtmosphereState]: AtmosphereState[K];
+};
+
+/**
+ * Allocate one atmosphere buffer, for callers that want to reuse it.
+ * Mirrors `createCelestialState` below. Values are the clear-midnight zero
+ * point and are fully overwritten by the first `sampleAtmosphere` call.
+ */
+export function createAtmosphereState(): MutableAtmosphereState {
+  return {
+    simulationMinutes: 0,
+    solarAngle: 0,
+    solarElevation: 0,
+    daylight: 0,
+    twilight: 0,
+    cloudCoverage: WEATHER_PROFILES.clear.cloudCoverage,
+    lightMultiplier: WEATHER_PROFILES.clear.lightMultiplier,
+    wetness: WEATHER_PROFILES.clear.wetness,
+    precipitation: WEATHER_PROFILES.clear.precipitation,
+    wind: WEATHER_PROFILES.clear.wind,
+    fogDensity: WEATHER_PROFILES.clear.fogDensity,
+  };
+}
+
+/**
+ * One deterministic atmosphere sample drives default sky, fog, light, water,
+ * and weather-responsive materials. It only depends on simulation state.
+ *
+ * `target` follows the same opt-in convention as `sampleCelestial`: pass a
+ * module-level scratch buffer from a `useFrame` callback to sample without
+ * allocating, or omit it and get a fresh object.
+ *
+ * THE DEFAULT MUST STAY A FRESH OBJECT. Several callers hold more than one
+ * sample alive at once and compare them against each other - see
+ * `__tests__/atmosphere.test.ts`, which pins the dawn/noon/dusk/night solar
+ * path by retaining four samples simultaneously, and asserts determinism with
+ * `expect(sampleAtmosphere(...)).toEqual(sampleAtmosphere(...))`. Making a
+ * shared buffer the default would collapse those four into one object and turn
+ * the determinism assertion vacuously true - a silent loss of coverage, not a
+ * visible failure. Reuse is per-call-site and opt-in for exactly that reason.
+ */
+export function sampleAtmosphere(
+  day: number,
+  hour: number,
+  weather: AtmosphereWeather,
+  target: MutableAtmosphereState = createAtmosphereState()
+): AtmosphereState {
+  const simulationMinutes = toSimulationMinutes({ day, hour });
+  const normalizedHour = (simulationMinutes / 60) % 24;
+  const solarAngle = ((normalizedHour - 6) / 24) * Math.PI * 2;
+  const solarElevation = Math.sin(solarAngle);
+  // A broad civil-twilight shoulder keeps the world readable after sunset.
+  const daylight = smoothstep(-0.35, 0.35, solarElevation);
+  const twilight =
+    Math.exp(-Math.pow((normalizedHour - 6) / 1.8, 2)) +
+    Math.exp(-Math.pow((normalizedHour - 18) / 1.8, 2));
+
+  const profile = WEATHER_PROFILES[weather] ?? WEATHER_PROFILES.clear;
+
+  target.simulationMinutes = simulationMinutes;
+  target.solarAngle = solarAngle;
+  target.solarElevation = solarElevation;
+  target.daylight = daylight;
+  target.twilight = twilight;
+  target.cloudCoverage = profile.cloudCoverage;
+  target.lightMultiplier = profile.lightMultiplier;
+  target.wetness = profile.wetness;
+  target.precipitation = profile.precipitation;
+  target.wind = profile.wind;
+  target.fogDensity = profile.fogDensity;
+  return target;
+}
+
+/**
+ * Derive every celestial visual and light from the same atmosphere sample.
+ * The sun follows a tilted great-circle orbit, while the moon stays opposite
+ * it to preserve the established twelve-hour day/night relationship.
+ */
+export function createCelestialState(): CelestialState {
+  return {
+    sunDirection: [0, 1, 0],
+    moonDirection: [0, -1, 0],
+    sunOpacity: 1,
+    moonOpacity: 0,
+    starOpacity: 0,
+    faintStarOpacity: 0,
+    goldenHour: 0,
+    // Seeded at the clear-noon values `sampleCelestial` produces, so the very
+    // first frame is already on the shipping key/fill ratio instead of easing
+    // in from a flat one.
+    sunLightIntensity: 3.1,
+    moonLightIntensity: 0,
+    ambientLightIntensity: 0.22,
+  };
+}
+
+export function sampleCelestial(
+  atmosphere: AtmosphereState,
+  target: CelestialState = createCelestialState()
+): CelestialState {
+  const orbitX = Math.cos(atmosphere.solarAngle);
+  const orbitY = atmosphere.solarElevation;
+  const orbitZ = Math.cos(atmosphere.solarAngle) * 0.16;
+  const inverseLength = 1 / Math.hypot(orbitX, orbitY, orbitZ);
+  // Dawn enters from site east (+X); afternoon crosses the west and south
+  // process glazing. Sky, water, IBL and shadows all use this common orbit.
+  // Working if the afternoon key reaches -X and +Z and stays unit length.
+  const azimuth = (50 * Math.PI) / 180;
+  target.sunDirection[0] =
+    (orbitX * Math.cos(azimuth) + orbitZ * Math.sin(azimuth)) * inverseLength;
+  target.sunDirection[1] = orbitY * inverseLength;
+  target.sunDirection[2] =
+    (-orbitX * Math.sin(azimuth) + orbitZ * Math.cos(azimuth)) * inverseLength;
+  target.moonDirection[0] = -target.sunDirection[0];
+  target.moonDirection[1] = -target.sunDirection[1];
+  target.moonDirection[2] = -target.sunDirection[2];
+
+  const sunVisibility = smoothstep(-0.1, 0.04, atmosphere.solarElevation);
+  const moonVisibility = 1 - smoothstep(-0.04, 0.18, atmosphere.solarElevation);
+  const visualDaylight = clamp01(atmosphere.daylight * atmosphere.lightMultiplier);
+  const clearSkyFactor = 1 - atmosphere.cloudCoverage * 0.82;
+  const goldenHour =
+    sunVisibility * (1 - smoothstep(0.08, 0.52, Math.max(0, atmosphere.solarElevation)));
+
+  const overcast = getOvercastWeight(atmosphere.cloudCoverage);
+  // A closed deck (rain, storm) hides the disc, the moon and the stars outright;
+  // broken cloud only veils them. `getOvercastDeck` is exactly 0 in clear and
+  // cloudy weather, so those skies are unchanged.
+  const open = 1 - getOvercastDeck(atmosphere.cloudCoverage);
+  target.sunOpacity =
+    sunVisibility * (1 - atmosphere.cloudCoverage * 0.42) * (1 - overcast) * (1 - overcast) * open;
+  target.moonOpacity = moonVisibility * (0.94 - atmosphere.cloudCoverage * 0.34) * open;
+  // Solar luminance, rather than weather-darkened world light, prevents
+  // stars appearing at midday during a storm. Cloud cover still veils them.
+  target.starOpacity = Math.pow(1 - atmosphere.daylight, 1.65) * 0.9 * clearSkyFactor * open;
+  // The sun model sets at 18:00 and is 15 degrees down at 19:00: nautical
+  // twilight, when the bright stars are out but the faint field is not. The
+  // single curve above had the whole field at 0.70 by then.
+  target.faintStarOpacity =
+    target.starOpacity * smoothstep(-0.21, -0.35, atmosphere.solarElevation);
+  target.goldenHour = goldenHour;
+  // KEY AND FILL ARE ONE DECISION, NOT TWO.
+  //
+  // These two lines used to read 1.84 and 0.76 at clear noon - a fill/key ratio
+  // of 0.98, which is flat lighting: no modelling, no form, and no reason for a
+  // shadow to exist even when the shadow pass is on. The sun is now the key at
+  // 3.10 and the omnidirectional term is cut to 0.22, roughly 3.8:1 before the
+  // hemisphere and the image-based environment are added, and about 4:1 after
+  // (see `SceneEnvironmentIBL`, which contributes PI * radiance *
+  // `scene.environmentIntensity` of diffuse irradiance to every standard
+  // material). Anything that reads these numbers is reading a lighting ratio,
+  // not an absolute brightness: `constants/colorGrade.ts` owns the exposure
+  // that maps them to the display.
+  //
+  // OVERCAST MOVES LIGHT FROM THE KEY INTO THE FILL. A cloud deck scatters the
+  // sun, it does not just dim it: rain keeps about a quarter of its key and
+  // returns the rest as sky fill (`overcastKeyScatter`), so its shadows are
+  // faint and soft and the skylights cast no hard patches. The fill takes
+  // 0.9 of the scattered daylight (0.5 dimmed a rain slab by a third).
+  const scattered = overcastKeyScatter(atmosphere.cloudCoverage);
+  target.sunLightIntensity = sunVisibility * (0.15 + visualDaylight * 2.95) * (1 - scattered);
+  // A low moon shines through several air masses and through the hall's side
+  // glazing at a raking angle; at 19:00 (15 degrees up) it threw full-strength
+  // window shafts across the packing floor. Extinction ramps it in with height.
+  const moonElevation = -atmosphere.solarElevation;
+  target.moonLightIntensity =
+    moonVisibility *
+    (1 - atmosphere.daylight) *
+    0.48 *
+    clearSkyFactor *
+    smoothstep(0.08, 0.5, moonElevation);
+  target.ambientLightIntensity =
+    0.1 +
+    visualDaylight * 0.12 +
+    scattered * visualDaylight * 0.9 +
+    moonVisibility * (1 - atmosphere.daylight) * 0.06;
+  return target;
+}

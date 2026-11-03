@@ -1,0 +1,23 @@
+# Game interface components
+
+This directory contains the focused simulation interface modules re-exported by
+`src/components/GameFeatures.tsx`.
+
+The notification system is caption-only and uses an autonomous plant corpus.
+It reports production milestones, machine states, logistics sequencing, safety
+interlocks, weather adaptation, and day or night facility state. No embodied
+characters, workforce rankings, or host voice services are part of the v0.40
+runtime.
+
+Key modules:
+
+- `shared.tsx`: machine-only notice corpus, schedulers, event mappings, and the
+  camera-feed context.
+- `PAAnnouncementSystem.tsx`: priority-aware accessible caption presentation.
+- `MiniMap.tsx`: factory, vehicle, and zone overview.
+- `IncidentReplayControls.tsx`: historical event playback.
+- `GamificationBar.tsx`: compact access to achievements, replay, map, and export.
+
+Announcements are state-driven and cooldown protected. Muting prevents their
+creation, critical safety notices pre-empt routine notices, and reduced-motion
+preferences remove ticker movement and pulse effects.

@@ -1,0 +1,66 @@
+import React from 'react';
+import { RotateCcw, Factory } from 'lucide-react';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
+import { useT } from '../../i18n';
+import { rotateDeviceOverlayMessages } from './RotateDeviceOverlay.messages';
+
+interface RotateDeviceOverlayProps {
+  visible: boolean;
+}
+
+/**
+ * Full-screen overlay prompting users to rotate their device to landscape.
+ * Shown on mobile devices in portrait orientation.
+ */
+export const RotateDeviceOverlay: React.FC<RotateDeviceOverlayProps> = ({ visible }) => {
+  const t = useT(rotateDeviceOverlayMessages);
+  const overlayRef = React.useRef<HTMLDivElement>(null);
+  // Rotation releases this notice; keyboard input stays inside its empty dialog.
+  // Working if Tab cannot reach the obscured dock and focus returns after rotation.
+  useFocusTrap(overlayRef as React.RefObject<HTMLElement>, visible, () => {});
+  if (!visible) return null;
+
+  return (
+    <div
+      ref={overlayRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="rotate-device-title"
+      className="fixed inset-0 z-[2000] bg-slate-950 flex flex-col items-center justify-center"
+      style={{
+        padding:
+          'max(32px, env(safe-area-inset-top)) max(32px, env(safe-area-inset-right)) max(32px, env(safe-area-inset-bottom)) max(32px, env(safe-area-inset-left))',
+      }}
+    >
+      {/* Animated rotating phone icon */}
+      <div className="relative mb-8" aria-hidden="true">
+        <div className="w-24 h-36 border-4 border-cyan-400 rounded-2xl relative">
+          {/* Phone notch */}
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 w-8 h-1 bg-cyan-400 rounded-full" />
+          {/* Screen content indicator */}
+          <div className="absolute inset-4 top-6 bg-cyan-400/20 rounded-lg" />
+        </div>
+        {/* Rotation arrow */}
+        <div className="absolute -right-8 top-1/2 -translate-y-1/2 text-cyan-400">
+          <RotateCcw className="w-8 h-8" style={{ transform: 'rotate(-90deg)' }} />
+        </div>
+      </div>
+
+      {/* Text prompt */}
+      <h2 id="rotate-device-title" className="text-2xl font-bold text-white mb-2 text-center">
+        {t('title')}
+      </h2>
+      <p className="text-slate-400 text-center max-w-xs">{t('body')}</p>
+
+      {/* Mill branding */}
+      <div
+        className="absolute text-slate-600 text-sm flex items-center gap-2"
+        style={{ bottom: 'max(32px, env(safe-area-inset-bottom))' }}
+      >
+        <Factory className="w-4 h-4" aria-hidden="true" />
+        <span>{t('branding')}</span>
+      </div>
+    </div>
+  );
+};

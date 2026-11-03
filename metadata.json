@@ -1,0 +1,5 @@
+{
+  "name": "MillOS Digital Twin",
+  "description": "AI-built grain mill factory simulator with SCADA integration, autonomous workers, forklifts, and live 3D process visualization.",
+  "requestFramePermissions": []
+}

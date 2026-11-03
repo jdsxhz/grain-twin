@@ -1,0 +1,1647 @@
+import React, { useRef, useMemo, useState, useEffect, useCallback } from 'react';
+import {
+  registerReplayParticipant,
+  isWorkplaceReplayRestoring,
+} from '../simulation/workplaceReplayRuntime';
+import { useFrame } from '@react-three/fiber';
+import { Billboard, Line } from '@react-three/drei';
+import { SceneText as Text, sceneTextLegible } from './shared/SceneText';
+import { positionRegistry, EntityPosition } from '../utils/positionRegistry';
+import { audioManager } from '../utils/audioManager';
+import { useAudioInitialized } from '../hooks/useAudioState';
+import { useForkliftMetricsSampler } from './useForkliftMetricsSampler';
+import { useSafetyStore } from '../stores/safetyStore';
+import { useGameSimulationStore } from '../stores/gameSimulationStore';
+import { useGraphicsStore } from '../stores/graphicsStore';
+import { useTruckScheduleStore } from '../stores/truckScheduleStore';
+import { useOperationsCampaignStore } from '../stores/operationsCampaignStore';
+import { useShallow } from 'zustand/react/shallow';
+import { getForkliftWarningColor } from '../utils/statusColors';
+import { ForkliftModel } from './models';
+import { applyCargoPresence, FORKLIFT_PALLET_REACH_METRES } from './models/ForkliftModel';
+import {
+  FORKLIFT_BEACON,
+  FORKLIFT_LOADED_TRAVEL_FORK_HEIGHT,
+  forkliftBeaconLabelHeight,
+} from './models/forkliftBeacon';
+import { shouldRunThisFrame } from '../utils/frameThrottle';
+import { ForkliftData } from '../types';
+import { POLYGON_OFFSET } from '../constants/renderLayers';
+import { createLinearDataTexture } from '../utils/textureGenerator';
+import { SITE_LAYOUT } from '../constants/siteLayout';
+import { useLogisticsLayoutStore } from '../stores/logisticsLayoutStore';
+import {
+  drivenLogisticsRoute,
+  reconcileLogisticsMotion,
+  registerLogisticsVehicle,
+} from '../simulation/logisticsRuntime';
+import { planningRouteActions, protectedEgressApproaches } from '../simulation/layoutPlanning';
+import { FORKLIFT_PALLET_CLEARANCE } from '../constants/dockLoading';
+import { plantTimeScale } from '../simulation/pace';
+import {
+  canPerformForkliftLogisticsAction,
+  hydraulicSoundSeconds,
+  isForkliftSimulationPaused,
+  resolveForkliftMastTilt,
+  type ForkliftOperationPhase,
+  type ForkliftWaypointAction,
+} from '../simulation/forkliftRoute';
+import {
+  createForkliftRoutePlan,
+  createInitialForkliftMotion,
+  distanceAheadOnClosedPath,
+  FORKLIFT_HOLD_CLEARANCE_METRES,
+  forkliftActionHoldDistance,
+  forkliftRouteHeading,
+  sampleForkliftLoadPose,
+  resolveForkliftActionStop,
+  forkliftActionPermitted,
+  nextForkliftActionCommitment,
+  resolveForkliftStopReason,
+  stepForkliftMotion,
+  type ForkliftLoadPhase,
+  type ForkliftRoutePlan,
+  type ForkliftStopReason,
+} from '../simulation/vehicles/forkliftController';
+import { sampleArcLengthPath } from '../simulation/vehicles/vehicleKinematics';
+
+/**
+ * The direction a forklift publishes for traffic checks: where the route goes
+ * from here. At a pickup or dropoff that turns, the path's own tangent still
+ * points along the arriving leg; the route heading is the leaving one.
+ */
+const routeDirection = (plan: ForkliftRoutePlan, distance: number): [number, number] => {
+  const heading = forkliftRouteHeading(plan, distance);
+  return [Math.sin(heading), Math.cos(heading)];
+};
+
+/**
+ * Per marker, how far short of it the forklift waits while the action is not
+ * yet permitted: outside the protected pedestrian approaches, so a forklift
+ * waiting for its truck never stands in the dock doorway. One entry per plan.
+ */
+const holdLegsByPlan = new WeakMap<ForkliftRoutePlan, number[]>();
+const markerHoldLegs = (plan: ForkliftRoutePlan): number[] => {
+  const cached = holdLegsByPlan.get(plan);
+  if (cached) return cached;
+  const corridors = protectedEgressApproaches();
+  const legs = plan.markers.map((marker) =>
+    distanceAheadOnClosedPath(
+      plan.path,
+      forkliftActionHoldDistance(plan, marker.distance, corridors, FORKLIFT_HOLD_CLEARANCE_METRES),
+      marker.distance
+    )
+  );
+  holdLegsByPlan.set(plan, legs);
+  return legs;
+};
+
+/** Distance along the route to approach or leave a raised work surface with forks at its height. */
+const SURFACE_APPROACH_METRES = 3;
+/** Fork height to travel at here: at least a raised surface's height near its marker. */
+const travelForkHeight = (plan: ForkliftRoutePlan, routeDistance: number, loaded: boolean) => {
+  let surface = 0;
+  for (const marker of plan.markers) {
+    const height = marker.action.surfaceForkHeight ?? 0;
+    if (height <= 0) continue;
+    const ahead = distanceAheadOnClosedPath(plan.path, routeDistance, marker.distance);
+    const behind = distanceAheadOnClosedPath(plan.path, marker.distance, routeDistance);
+    if (Math.min(ahead, behind) <= SURFACE_APPROACH_METRES) surface = Math.max(surface, height);
+  }
+  if (surface <= 0) return loaded ? FORKLIFT_LOADED_TRAVEL_FORK_HEIGHT : 0;
+  return loaded
+    ? Math.max(FORKLIFT_LOADED_TRAVEL_FORK_HEIGHT, surface + FORKLIFT_PALLET_CLEARANCE)
+    : surface;
+};
+import {
+  vehicleTelemetryRegistry,
+  type VehicleTelemetrySnapshot,
+} from '../simulation/vehicles/vehicleTelemetryRegistry';
+import * as THREE from 'three';
+import { applyWorldSurface } from '../utils/worldSurface';
+import { translate, useT } from '../i18n';
+import { forkliftSystemMessages } from './ForkliftSystem.messages';
+
+// Path visualization component - shows forklift routes on the floor. The dashed
+// line follows the rounded route; markers sit only on the authored waypoints,
+// not on every corner-rounding sample.
+const ForkliftPath: React.FC<{
+  path: [number, number, number][];
+  waypoints: [number, number, number][];
+  waypointActions: WaypointAction[];
+  color: string;
+}> = ({ path, waypoints, waypointActions, color }) => {
+  // PERF: Reuse Vector3 objects instead of allocating new ones each path change
+  const pointsRef = useRef<THREE.Vector3[]>([]);
+  const points = useMemo(() => {
+    const pts = pointsRef.current;
+    const targetLength = path.length + 1; // +1 for closing the loop
+    // Resize array if needed (only grows, never shrinks to avoid allocation churn)
+    while (pts.length < targetLength) {
+      pts.push(new THREE.Vector3());
+    }
+    // Update point values
+    for (let i = 0; i < path.length; i++) {
+      pts[i].set(path[i][0], 0.1, path[i][2]); // Above floor to prevent z-fighting
+    }
+    // Close the loop
+    pts[path.length].copy(pts[0]);
+    // Return only the slice we need (in case array is larger from previous path)
+    return pts.slice(0, targetLength);
+  }, [path]);
+
+  return (
+    <group name="forklift-route-path">
+      {/* Main path line */}
+      <Line
+        points={points}
+        color={color}
+        lineWidth={2}
+        dashed
+        dashSize={0.5}
+        dashScale={2}
+        gapSize={0.3}
+      />
+      {/* Waypoint markers. A closing point that repeats the first is skipped;
+          pickup and dropoff stops get a wider ring. */}
+      {waypoints.map((point, i) => {
+        const isClosingRepeat =
+          i > 0 &&
+          i === waypoints.length - 1 &&
+          point[0] === waypoints[0][0] &&
+          point[2] === waypoints[0][2];
+        if (isClosingRepeat) return null;
+        const next = waypoints[(i + 1) % waypoints.length];
+        const isStop =
+          waypointActions[i]?.type === 'pickup' || waypointActions[i]?.type === 'dropoff';
+        return (
+          <group key={`waypoint-${i}-${point[0]}-${point[2]}`} position={[point[0], 0.1, point[2]]}>
+            {/* Circle marker */}
+            <mesh rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={isStop ? [0.55, 0.8, 24] : [0.3, 0.5, 16]} />
+              <meshBasicMaterial
+                color={color}
+                transparent
+                opacity={0.6}
+                depthWrite={false}
+                polygonOffset
+                polygonOffsetFactor={POLYGON_OFFSET.standard.factor}
+                polygonOffsetUnits={POLYGON_OFFSET.standard.units}
+              />
+            </mesh>
+            {/* Direction arrow to next point */}
+            <mesh
+              rotation={[-Math.PI / 2, 0, Math.atan2(next[0] - point[0], next[2] - point[2])]}
+              position={[0, 0.05, 0]}
+            >
+              <coneGeometry args={[0.2, 0.4, 3]} />
+              <meshBasicMaterial
+                color={color}
+                transparent
+                opacity={0.4}
+                depthWrite={false}
+                polygonOffset
+                polygonOffsetFactor={POLYGON_OFFSET.standard.factor}
+                polygonOffsetUnits={POLYGON_OFFSET.standard.units}
+              />
+            </mesh>
+          </group>
+        );
+      })}
+    </group>
+  );
+};
+
+/** Turn rate of the beacon's reflector, in radians per second. */
+const BEACON_SWEEP_RATE = 4;
+
+/** Glow brightness (sprite opacity) with the lamp on and between flashes. */
+const BEACON_GLOW_ON = 0.85;
+const BEACON_GLOW_OFF = 0.2;
+
+/**
+ * The glow's falloff: white, alpha from 1 at the centre to 0 at the rim with a
+ * soft square-law tail, so the sprite's quad never shows an edge. Shared by
+ * every forklift; each one's colour and flash ride its own material.
+ */
+const BEACON_GLOW_TEXTURE = (() => {
+  const size = 64;
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y += 1)
+    for (let x = 0; x < size; x += 1) {
+      const r = Math.hypot((x + 0.5) / size - 0.5, (y + 0.5) / size - 0.5) * 2;
+      const falloff = Math.max(0, 1 - r);
+      const i = (y * size + x) * 4;
+      data[i] = 255;
+      data[i + 1] = 255;
+      data[i + 2] = 255;
+      data[i + 3] = Math.round(255 * falloff * falloff);
+    }
+  const texture = createLinearDataTexture(data, size, size);
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  return texture;
+})();
+
+const BEACON_BASE_MATERIAL = new THREE.MeshStandardMaterial({
+  name: 'forklift-beacon-base',
+  color: '#1e2124',
+  roughness: 0.6,
+  metalness: 0.2,
+});
+
+/**
+ * Rotating safety beacon: base, lens, dome and a turning reflector
+ * (`FORKLIFT_BEACON`), plus a small camera-facing glow for its light.
+ *
+ * THE LIGHT IS MOUNTED UNCONDITIONALLY AND DRIVEN BY `intensity`. It used to be
+ * conditionally rendered AND toggled with `visible`, and both are the same
+ * mistake: `WebGLRenderer.projectObject` skips invisible objects entirely, so an
+ * invisible light leaves the light arrays, `numPointLights` changes, and the
+ * program cache key of every material in the scene changes with it. The flash
+ * runs at 5-15 Hz, so the renderer was re-acquiring programs and re-uploading
+ * every material's uniforms several times a second. Holding the light in the
+ * tree at `intensity = 0` keeps the count constant, and gives the beacon real
+ * illumination while it is moving rather than only when it stops.
+ *
+ * The glow is an additive sprite rather than a spotlight for the same reason:
+ * a mesh's `visible` flag costs nothing, a light's changes every shader. The
+ * real point light is reserved for high and ultra because each point light
+ * adds a loop to every lit material in the complete scene. Medium keeps the
+ * emissive lens, the turning hot spot and the glow without that cost. The
+ * glow replaced an open light cone that read as an editor gizmo
+ * (`forkliftBeacon.ts`).
+ *
+ * The same rule covers LOD: the beacon stays mounted in the far tier, where
+ * `showGeometry` hides only the lamp and glow (the billboard has its own
+ * beacon mesh), so crossing the LOD distance never changes the light count.
+ */
+const WarningLight = React.memo<{
+  isStopped: boolean;
+  isInCrossing: boolean;
+  simulationPaused: boolean;
+  height: number;
+  showGeometry: boolean;
+}>(({ isStopped, isInCrossing, simulationPaused, height, showGeometry }) => {
+  // Use ref instead of useState to avoid triggering re-renders in useFrame
+  const flashRef = useRef(false);
+  const glowRef = useRef<THREE.SpriteMaterial>(null);
+  const lightRef = useRef<THREE.PointLight>(null);
+  const sweepRef = useRef<THREE.Group>(null);
+  const isTabVisible = useGameSimulationStore((state) => state.isTabVisible);
+  const graphicsQuality = useGraphicsStore((state) => state.graphics.quality);
+  const realLightEnabled = graphicsQuality === 'high' || graphicsQuality === 'ultra';
+  // One emissive material for the lens and its dome, flashed in place.
+  const lensMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        name: 'forklift-beacon-lens',
+        emissiveIntensity: 0.5,
+        roughness: 0.3,
+        metalness: 0,
+        // TRUE, not false: this component renders at `low` as well, where
+        // there is no composer and `false` would clamp the lit emissive to a
+        // flat white blob instead of letting the Neutral curve roll it off.
+        toneMapped: true,
+      }),
+    []
+  );
+  useEffect(() => () => lensMaterial.dispose(), [lensMaterial]);
+
+  useFrame((state, delta) => {
+    // PERFORMANCE: Skip animations when tab hidden
+    if (!isTabVisible || simulationPaused) return;
+    if (sweepRef.current) {
+      sweepRef.current.rotation.y += BEACON_SWEEP_RATE * Math.min(delta, 0.1);
+    }
+    // PERFORMANCE: Throttle flash check to every 2nd frame (~30fps is plenty for light flashing)
+    if (!shouldRunThisFrame(2)) return;
+    // Flash faster when stopped (red), medium for crossing (blue), slower when moving (amber)
+    const flashSpeed = isStopped ? 15 : isInCrossing ? 10 : 5;
+    const newFlash = Math.sin(state.clock.elapsedTime * flashSpeed) > 0;
+
+    // Update material directly via ref instead of triggering re-render
+    if (newFlash !== flashRef.current) {
+      flashRef.current = newFlash;
+      lensMaterial.emissiveIntensity = newFlash ? 3 : 0.5;
+      if (glowRef.current) {
+        glowRef.current.opacity = newFlash ? BEACON_GLOW_ON : BEACON_GLOW_OFF;
+      }
+      if (lightRef.current) {
+        lightRef.current.intensity = newFlash ? 1.6 : 0;
+      }
+    }
+  });
+
+  // Red when stopped, blue when in crossing zone, amber when normal
+  const color = getForkliftWarningColor(isStopped, isInCrossing);
+  useEffect(() => {
+    lensMaterial.color.set(color);
+    lensMaterial.emissive.set(color);
+  }, [lensMaterial, color]);
+  const { base, lens, dome, reflector, glow } = FORKLIFT_BEACON;
+  const lensCentre = (lens.bottom + lens.top) / 2;
+
+  return (
+    <group position={[0, height, FORKLIFT_BEACON.mountZ]}>
+      <group visible={showGeometry}>
+        <mesh position={[0, (base.bottom + base.top) / 2, 0]} material={BEACON_BASE_MATERIAL}>
+          <cylinderGeometry args={[base.radius, base.radius, base.top - base.bottom, 16]} />
+        </mesh>
+        {/* Lens and dome share the flashing emissive material. */}
+        <mesh position={[0, lensCentre, 0]} material={lensMaterial}>
+          <cylinderGeometry args={[lens.radius, lens.radius, lens.top - lens.bottom, 16]} />
+        </mesh>
+        <mesh
+          position={[0, dome.bottom, 0]}
+          scale={[1, (dome.top - dome.bottom) / dome.radius, 1]}
+          material={lensMaterial}
+        >
+          <sphereGeometry args={[dome.radius, 16, 6, 0, Math.PI * 2, 0, Math.PI / 2]} />
+        </mesh>
+        {/* The reflector's hot spot, turning round the lens face. */}
+        <group ref={sweepRef} position={[0, reflector.y, 0]}>
+          <mesh position={[0, 0, reflector.radius + reflector.depth / 2]}>
+            <boxGeometry args={[reflector.width, reflector.height, reflector.depth]} />
+            <meshBasicMaterial color={color} />
+          </mesh>
+        </group>
+        <sprite
+          position={[0, lensCentre, 0]}
+          scale={[glow.diameter, glow.diameter, 1]}
+          renderOrder={8}
+        >
+          <spriteMaterial
+            ref={glowRef}
+            map={BEACON_GLOW_TEXTURE}
+            color={color}
+            opacity={BEACON_GLOW_OFF}
+            transparent
+            depthWrite={false}
+            blending={THREE.AdditiveBlending}
+          />
+        </sprite>
+      </group>
+      {realLightEnabled && (
+        <pointLight ref={lightRef} color={color} intensity={0} distance={7} decay={2} />
+      )}
+    </group>
+  );
+});
+
+/**
+ * sRGB of the authored forklift's linear `painted-safety-amber` baseColorFactor
+ * (0.6939, 0.3231, 0.0242). Keeps the far LOD the same hue as the near one.
+ */
+const BILLBOARD_AMBER = '#d99a2b';
+
+/**
+ * LOD hysteresis band, in metres.
+ *
+ * Widened from 50/40. The near model is the 52k-triangle GLB and the far one is
+ * a handful of boxes, so the swap is the most visible thing the forklift does;
+ * pushing it out removes it from normal camera framing. The band is WIDENED,
+ * never narrowed - `distanceTier` is React state written from `useFrame`, so a
+ * narrow band makes `setDistanceTier` thrash and re-render every frame.
+ */
+const FORKLIFT_LOD_FAR_METRES = 62;
+/** The fleet tag's em, metres; the status line under it is smaller and hides with it. */
+const FORKLIFT_LABEL_FONT_SIZE = 0.17;
+const FORKLIFT_LOD_CLOSE_METRES = 50;
+
+// Simplified forklift billboard for distant rendering (50+ units away)
+// Uses only 4 meshes instead of ~40+ for massive performance improvement
+/**
+ * Far-tier LOD materials, and why they carry the same finish as the near model.
+ *
+ * `test-results/pass7/unfinished-models.mjs` measures this group at 5.5 m per
+ * forklift with nothing on it, while `ForkliftModel` finishes every material on
+ * the near tier. That is not merely an omission: the LOD swap is a
+ * SUBSTITUTION, and the comment on the body colour below already records what
+ * that costs — the amber was matched to the authored GLB's linear
+ * `painted-safety-amber` precisely so "the LOD swap popped in colour as well as
+ * silhouette". An unfinished far tier reintroduces the same class of pop in the
+ * SURFACE: a forklift that acquires grime, dust and worn edges the moment it
+ * crosses the LOD distance and loses them when it recedes.
+ *
+ * Module-level and shared across both tiers' instances: `InstancedMesh` and
+ * these few meshes are outside `StaticMeshBatch` either way, and one
+ * `customProgramCacheKey` serves every profile, so this costs no draw call and
+ * no permutation.
+ *
+ * The beacon is deliberately absent — emissive at 1.1, and `isOutOfSurfaceScope`
+ * declines emitters.
+ */
+const BILLBOARD_MATERIALS = {
+  body: applyWorldSurface(
+    new THREE.MeshStandardMaterial({ color: BILLBOARD_AMBER, roughness: 0.42, metalness: 0 }),
+    'vehicle'
+  ),
+  cabin: applyWorldSurface(
+    new THREE.MeshStandardMaterial({ color: '#1f2937', roughness: 0.8, metalness: 0 }),
+    'vehicle'
+  ),
+  steel: applyWorldSurface(
+    new THREE.MeshStandardMaterial({ color: '#374151', roughness: 0.4, metalness: 0.85 }),
+    'metal'
+  ),
+  mast: applyWorldSurface(
+    new THREE.MeshStandardMaterial({ color: '#374151', roughness: 0.35, metalness: 0.85 }),
+    'metal'
+  ),
+};
+
+const ForkliftBillboard: React.FC<{ cargoPresenceRef: React.MutableRefObject<number> }> = ({
+  cargoPresenceRef,
+}) => {
+  // The far tier draws the same pallet presence as the near models.
+  const cargoMeshRef = useRef<THREE.Mesh>(null);
+  const cargoMaterialRef = useRef<THREE.MeshStandardMaterial>(null);
+  const isTabVisible = useGameSimulationStore((state) => state.isTabVisible);
+
+  useFrame(() => {
+    if (!isTabVisible) return;
+    applyCargoPresence(cargoPresenceRef, cargoMeshRef.current, [
+      cargoMaterialRef.current ?? undefined,
+    ]);
+  });
+
+  return (
+    <group name="forklift-billboard">
+      {/* Simple body - single box.
+          BILLBOARD_AMBER is the sRGB of the authored GLB's linear
+          `painted-safety-amber` (0.694, 0.323, 0.024). The old `#f59e0b` was a
+          different hue, so the LOD swap popped in colour as well as
+          silhouette; matching it leaves only the silhouette delta. */}
+      <mesh position={[0, 0.7, -0.35]} castShadow receiveShadow>
+        <boxGeometry args={[1.5, 1.2, 1.8]} />
+        <primitive object={BILLBOARD_MATERIALS.body} attach="material" />
+      </mesh>
+      {/* Cabin */}
+      <mesh position={[0, 1.5, -0.3]} castShadow receiveShadow>
+        <boxGeometry args={[1.2, 0.8, 1]} />
+        <primitive object={BILLBOARD_MATERIALS.cabin} attach="material" />
+      </mesh>
+      {/* ROPS canopy and pillars. The near model is 2.3 m tall with an overhead
+          guard; without these the far tier is a 1.2 m box and the swap reads as
+          a different vehicle rather than a different level of detail. */}
+      <mesh position={[0, 2.05, -0.35]} castShadow receiveShadow>
+        <boxGeometry args={[1.42, 0.08, 1.22]} />
+        <primitive object={BILLBOARD_MATERIALS.body} attach="material" />
+      </mesh>
+      {[-0.6, 0.6].map((x) => (
+        <mesh key={`rops-${x}`} position={[x, 1.6, -0.85]} castShadow receiveShadow>
+          <boxGeometry args={[0.09, 0.9, 0.09]} />
+          <primitive object={BILLBOARD_MATERIALS.steel} attach="material" />
+        </mesh>
+      ))}
+      {/* Beacon, so the far silhouette has the same topmost feature. */}
+      <mesh position={[0, 2.16, -0.35]}>
+        <cylinderGeometry args={[0.09, 0.09, 0.14, 8]} />
+        <meshStandardMaterial
+          color="#4a3200"
+          emissive="#ff8c00"
+          emissiveIntensity={1.1}
+          roughness={0.35}
+          metalness={0}
+          toneMapped
+        />
+      </mesh>
+      {/* Mast */}
+      <mesh position={[0, 1.2, 0.66]} castShadow receiveShadow>
+        <boxGeometry args={[0.8, 2, 0.15]} />
+        <primitive object={BILLBOARD_MATERIALS.mast} attach="material" />
+      </mesh>
+      {/* Cargo - always mounted, opacity from the shared presence */}
+      <mesh
+        ref={cargoMeshRef}
+        position={[0, 1.4, FORKLIFT_PALLET_REACH_METRES.compact]}
+        castShadow
+        receiveShadow
+        visible={cargoPresenceRef.current > 0.01}
+      >
+        <boxGeometry args={[0.9, 0.7, 0.9]} />
+        {/* Sacking on a pallet, in OBJECT rest space - the forklift drives, and
+            a world-space field would slide the weave across the load. */}
+        <meshStandardMaterial
+          ref={(mat) => {
+            cargoMaterialRef.current = mat;
+            if (mat) applyWorldSurface(mat, 'fabric');
+          }}
+          color="#fef3c7"
+          roughness={0.7}
+          metalness={0}
+          transparent
+          opacity={cargoPresenceRef.current}
+        />
+      </mesh>
+    </group>
+  );
+};
+
+type ForkliftOperation = ForkliftOperationPhase;
+
+type WaypointAction = ForkliftWaypointAction;
+
+interface Forklift {
+  id: string;
+  position: [number, number, number];
+  rotation: number;
+  speed: number;
+  path: [number, number, number][];
+  pathActions: WaypointAction[]; // Action at each waypoint
+  pathIndex: number;
+  cargo: 'empty' | 'pallet';
+}
+
+/** A forklift on its rounded route, keeping the authored waypoints for the overlay. */
+interface RoutedForklift extends Forklift {
+  authoredPath: [number, number, number][];
+  authoredActions: WaypointAction[];
+}
+
+const withRoundedRoute = (forklift: Forklift): RoutedForklift => {
+  const dock = forklift.id === 'forklift-1' ? 'shipping' : 'receiving';
+  const route = drivenLogisticsRoute(dock, forklift.path);
+  return {
+    ...forklift,
+    path: route.path,
+    pathActions: route.actions,
+    authoredPath: forklift.path,
+    authoredActions: forklift.pathActions,
+  };
+};
+
+// In-world tags use the SCADA vehicle names (tagDatabase FLT01/FLT02) plus the
+// forklift's role; data.id stays the key for logic and selection. The role is a
+// message key so the tag follows the interface language at render time.
+const FORKLIFT_DISPLAY_LABELS: Record<
+  string,
+  { tag: string; role: 'roleShipping' | 'roleReceiving' }
+> = {
+  'forklift-1': { tag: 'FLT01', role: 'roleShipping' },
+  'forklift-2': { tag: 'FLT02', role: 'roleReceiving' },
+};
+
+// Path colors for each forklift
+const PATH_COLORS = ['#f59e0b', '#3b82f6']; // Amber for first, blue for second
+
+// Conveyor crossing zones - areas where forklifts must yield
+// Placements come from the same layout as the belt geometry.
+interface CrossingZone {
+  id: string;
+  xMin: number;
+  xMax: number;
+  zMin: number;
+  zMax: number;
+  type: 'conveyor' | 'intersection';
+}
+
+const CROSSING_ZONES: CrossingZone[] = Object.values(SITE_LAYOUT.routeHazards).map(
+  ({ id, type, bounds }) => ({
+    id,
+    type,
+    xMin: bounds.minX,
+    xMax: bounds.maxX,
+    zMin: bounds.minZ,
+    zMax: bounds.maxZ,
+  })
+);
+
+// Check if a position is within any crossing zone
+const isInCrossingZone = (x: number, z: number): CrossingZone | null => {
+  for (const zone of CROSSING_ZONES) {
+    if (x >= zone.xMin && x <= zone.xMax && z >= zone.zMin && z <= zone.zMax) {
+      return zone;
+    }
+  }
+  return null;
+};
+
+// Deterministic reservation table. A crossing belongs to one autonomous
+// vehicle until it exits, preventing two independent wait timers from granting
+// simultaneous entry on the same frame.
+const crossingReservations = new Map<string, string>();
+
+// Crossing zone visual component
+const CrossingZoneMarkers: React.FC = () => {
+  return (
+    <group>
+      {CROSSING_ZONES.map((zone) => {
+        // Guard against NaN/invalid dimensions
+        const xWidth = Math.max(0.1, Math.abs(zone.xMax - zone.xMin));
+        const zHeight = Math.max(0.1, Math.abs(zone.zMax - zone.zMin));
+
+        return (
+          <group key={zone.id}>
+            {/* Hazard stripe markings on floor - raised to prevent z-fighting */}
+            <mesh
+              position={[(zone.xMin + zone.xMax) / 2, 0.08, zone.zMin]}
+              rotation={[-Math.PI / 2, 0, 0]}
+            >
+              <planeGeometry args={[xWidth, 0.3]} />
+              <meshStandardMaterial
+                color="#fbbf24"
+                transparent
+                opacity={0.6}
+                depthWrite={false}
+                polygonOffset
+                polygonOffsetFactor={POLYGON_OFFSET.standard.factor}
+                polygonOffsetUnits={POLYGON_OFFSET.standard.units}
+                roughness={0.85}
+              />
+            </mesh>
+            <mesh
+              position={[(zone.xMin + zone.xMax) / 2, 0.08, zone.zMax]}
+              rotation={[-Math.PI / 2, 0, 0]}
+            >
+              <planeGeometry args={[xWidth, 0.3]} />
+              <meshStandardMaterial
+                color="#fbbf24"
+                transparent
+                opacity={0.6}
+                depthWrite={false}
+                polygonOffset
+                polygonOffsetFactor={POLYGON_OFFSET.standard.factor}
+                polygonOffsetUnits={POLYGON_OFFSET.standard.units}
+                roughness={0.85}
+              />
+            </mesh>
+            {/* Side markers */}
+            <mesh
+              position={[zone.xMin, 0.08, (zone.zMin + zone.zMax) / 2]}
+              rotation={[-Math.PI / 2, 0, 0]}
+            >
+              <planeGeometry args={[0.3, zHeight]} />
+              <meshStandardMaterial
+                color="#fbbf24"
+                transparent
+                opacity={0.6}
+                depthWrite={false}
+                polygonOffset
+                polygonOffsetFactor={POLYGON_OFFSET.standard.factor}
+                polygonOffsetUnits={POLYGON_OFFSET.standard.units}
+                roughness={0.85}
+              />
+            </mesh>
+            <mesh
+              position={[zone.xMax, 0.08, (zone.zMin + zone.zMax) / 2]}
+              rotation={[-Math.PI / 2, 0, 0]}
+            >
+              <planeGeometry args={[0.3, zHeight]} />
+              <meshStandardMaterial
+                color="#fbbf24"
+                transparent
+                opacity={0.6}
+                depthWrite={false}
+                polygonOffset
+                polygonOffsetFactor={POLYGON_OFFSET.standard.factor}
+                polygonOffsetUnits={POLYGON_OFFSET.standard.units}
+                roughness={0.85}
+              />
+            </mesh>
+            {/* Warning text */}
+            <Text
+              surface="painted"
+              position={[zone.xMin + 3, 0.1, (zone.zMin + zone.zMax) / 2]}
+              rotation={[-Math.PI / 2, 0, 0]}
+              fontSize={0.5}
+              color="#fbbf24"
+              anchorX="center"
+              anchorY="middle"
+            >
+              YIELD
+            </Text>
+            <Text
+              surface="painted"
+              position={[zone.xMax - 3, 0.1, (zone.zMin + zone.zMax) / 2]}
+              rotation={[-Math.PI / 2, 0, 0]}
+              fontSize={0.5}
+              color="#fbbf24"
+              anchorX="center"
+              anchorY="middle"
+            >
+              YIELD
+            </Text>
+          </group>
+        );
+      })}
+    </group>
+  );
+};
+
+// ForkliftData is now imported from types.ts - use the canonical definition
+// Re-export for backwards compatibility
+export type { ForkliftData } from '../types';
+
+interface ForkliftSystemProps {
+  showSpeedZones?: boolean;
+  onSelectForklift?: (forklift: ForkliftData) => void;
+}
+
+export const ForkliftSystem: React.FC<ForkliftSystemProps> = ({
+  showSpeedZones = false,
+  onSelectForklift,
+}) => {
+  const layout = useLogisticsLayoutStore((state) => state.layout);
+  const forklifts = useMemo<RoutedForklift[]>(
+    () =>
+      (['shipping', 'receiving'] as const).map((dock, index) =>
+        withRoundedRoute({
+          id: `forklift-${index + 1}`,
+          position: [...layout.routes[dock][0]],
+          rotation: index === 0 ? 0 : Math.PI,
+          speed: index === 0 ? 3.5 : 3,
+          path: layout.routes[dock].map((point) => [...point]),
+          pathActions: planningRouteActions(dock),
+          pathIndex: 0,
+          cargo: 'empty',
+        })
+      ),
+    [layout]
+  );
+
+  useEffect(
+    () =>
+      registerReplayParticipant('forklift-crossings', {
+        capture: () =>
+          [...crossingReservations.entries()].filter(
+            ([, owner]) => owner === 'forklift-1' || owner === 'forklift-2'
+          ),
+        restore: (entries) => {
+          const ownedIds = new Set(['forklift-1', 'forklift-2']);
+          crossingReservations.forEach((owner, crossingId) => {
+            if (ownedIds.has(owner)) crossingReservations.delete(crossingId);
+          });
+          for (const [crossingId, owner] of entries) {
+            if (ownedIds.has(owner)) crossingReservations.set(crossingId, owner);
+          }
+        },
+      }),
+    []
+  );
+
+  return (
+    <group name="forklift-system">
+      {/* Render crossing zone markers on floor */}
+      {showSpeedZones && (
+        <>
+          <CrossingZoneMarkers />
+          {forklifts.map((f, i) => (
+            <ForkliftPath
+              key={`path-${f.id}`}
+              path={f.path}
+              waypoints={f.authoredPath}
+              waypointActions={f.authoredActions}
+              color={PATH_COLORS[i % PATH_COLORS.length]}
+            />
+          ))}
+        </>
+      )}
+      {/* Render forklifts */}
+      {forklifts.map((f) => (
+        <Forklift key={f.id} data={f} onSelect={onSelectForklift} />
+      ))}
+    </group>
+  );
+};
+
+const Forklift: React.FC<{ data: Forklift; onSelect?: (forklift: ForkliftData) => void }> = ({
+  data,
+  onSelect,
+}) => {
+  const t = useT(forkliftSystemMessages);
+  const displayLabel = FORKLIFT_DISPLAY_LABELS[data.id];
+  const ref = useRef<THREE.Group>(null);
+  const initialRoutePlan = useMemo(
+    () => createForkliftRoutePlan(data.path, data.pathActions),
+    [data.path, data.pathActions]
+  );
+  const routePlanRef = useRef(initialRoutePlan);
+  const motionStateRef = useRef(createInitialForkliftMotion(initialRoutePlan, data.position));
+  const dock = data.id === 'forklift-1' ? 'shipping' : 'receiving';
+  const actionMarkerIndexRef = useRef(0);
+  const actionCommittedRef = useRef(false);
+  const [isStopped, setIsStopped] = useState(false);
+  const [distanceTier, setDistanceTier] = useState<'close' | 'far'>('close'); // LOD tier for rendering
+  // The fleet tag hides once its em is too few rows to hold together (see
+  // SCENE_TEXT_MIN_EM_PIXELS): a group flag, written from useFrame, no render.
+  const labelGroupRef = useRef<THREE.Group>(null);
+  const [hasCargo, setHasCargo] = useState(data.cargo === 'pallet');
+  const [currentOperation, setCurrentOperation] = useState<ForkliftOperation>('traveling');
+  const forkHeightRef = useRef(0); // Ref for fork animation - avoids re-renders
+  const hasCargoRef = useRef(data.cargo === 'pallet'); // Ref mirror for useFrame access
+  // The one pallet visibility every render tier reads (sampleForkliftLoadPose's
+  // cargoPresence during an operation), so no tier fades on its own clock.
+  const cargoPresenceRef = useRef(data.cargo === 'pallet' ? 1 : 0);
+  const operationRef = useRef<ForkliftOperation>('traveling'); // Ref mirror for useFrame access
+  const loadPhaseRef = useRef<ForkliftLoadPhase>('idle');
+  const stopReasonRef = useRef<ForkliftStopReason>('none');
+  const cameraDistanceRef = useRef(0); // Track distance to camera
+  // Mirrored into state so the beacon recolours on entry and exit; it flips only
+  // a couple of times per lap, so the re-render is cheap.
+  const isInCrossingRef = useRef(false);
+  const [isInCrossing, setIsInCrossing] = useState(false);
+  const dirNormalizedRef = useRef(new THREE.Vector3());
+  // One snapshot per vehicle, mutated each frame; the registry copies it on publish.
+  const telemetryRef = useRef<VehicleTelemetrySnapshot>({
+    id: data.id,
+    type: 'forklift',
+    speedMps: 0,
+    steeringRadians: 0,
+    phase: 'idle',
+    stopReason: 'none',
+    articulationRadians: 0,
+    transferReady: false,
+  });
+  const stateChangeTimerRef = useRef(0); // Hysteresis timer
+  const frameCountRef = useRef(0); // Frame counter for throttling
+  const lastCollisionCheckRef = useRef({
+    pathClear: true,
+    obstaclePathClear: true,
+    forkliftsNearby: [] as EntityPosition[],
+  });
+  const crossingTimerRef = useRef(0); // Time spent waiting at crossing
+  const operationTimerRef = useRef(0); // Time spent on current loading/unloading operation
+  const operationDurationRef = useRef(0); // Target duration for current operation
+  const currentSpeedRef = useRef(0);
+  const steeringAngleRef = useRef(0);
+  const innerSteeringAngleRef = useRef(0);
+  const outerSteeringAngleRef = useRef(0);
+  const mastTiltRef = useRef(resolveForkliftMastTilt('traveling', data.cargo === 'pallet'));
+  const HYSTERESIS_TIME = 0.15; // 150ms before state can change
+  const CROSSING_WAIT_TIME = 1.0; // Wait 1.0s before entering crossing zone
+  const CROSSING_APPROACH_DISTANCE = 3; // Distance to start slowing for crossing
+  const FORK_LIFT_HEIGHT = 0.72; // Pallet clearance lift; loaded travel settles to 0.32 m
+  const recordSafetyStop = useSafetyStore((state) => state.recordSafetyStop);
+  const forkliftEmergencyStop = useSafetyStore((state) => state.forkliftEmergencyStop);
+  const isTabVisible = useGameSimulationStore((state) => state.isTabVisible);
+  const emergencyDrillMode = useGameSimulationStore((state) => state.emergencyDrillMode);
+  const gameSpeed = useGameSimulationStore((state) => state.gameSpeed);
+  const audioReady = useAudioInitialized();
+  const truckTransferReady = useTruckScheduleStore(
+    useShallow((state) => ({
+      shipping: state.truckSchedule.shipping.transferReady,
+      receiving: state.truckSchedule.receiving.transferReady,
+    }))
+  );
+  const dispatchExecution = useOperationsCampaignStore(
+    useShallow((state) => ({
+      releasedFinishedKg: state.execution.releasedFinishedKg,
+      loadStatus: state.execution.dispatchLoad.status,
+    }))
+  );
+  const vehicleSpeedMultiplier = useOperationsCampaignStore(
+    (state) => state.getIncidentEffect().vehicleSpeedMultiplier
+  );
+  const canPerformWaypointAction = useCallback(
+    (action: 'pickup' | 'dropoff'): boolean => {
+      return canPerformForkliftLogisticsAction({
+        forkliftId: data.id,
+        action,
+        shippingDocked: truckTransferReady.shipping,
+        receivingDocked: truckTransferReady.receiving,
+        releasedFinishedKg: dispatchExecution.releasedFinishedKg,
+        dispatchLoadStatus: dispatchExecution.loadStatus,
+      });
+    },
+    [
+      data.id,
+      dispatchExecution.loadStatus,
+      dispatchExecution.releasedFinishedKg,
+      truckTransferReady.receiving,
+      truckTransferReady.shipping,
+    ]
+  );
+
+  const graphicsQuality = useGraphicsStore((state) => state.graphics.quality);
+  const authoredVehicleVisual = graphicsQuality !== 'low';
+  // Per-vehicle wear. Two identically-grimy forklifts read as one asset drawn
+  // twice, so the amount is derived from the id and differs across the fleet.
+  const forkliftGrime = data.id === 'forklift-1' ? 0.74 : 0.52;
+  const effectiveStopped = isStopped || forkliftEmergencyStop || emergencyDrillMode;
+  const simulationPaused = isForkliftSimulationPaused(gameSpeed);
+  const motionStopped = effectiveStopped || simulationPaused;
+  const isOperating = currentOperation === 'loading' || currentOperation === 'unloading';
+  const replayOperationRef = useRef<ForkliftOperation | null>(null);
+  const stoppedMirrorRef = useRef(isStopped);
+  stoppedMirrorRef.current = isStopped;
+  const effectiveStoppedRef = useRef(effectiveStopped);
+  effectiveStoppedRef.current = effectiveStopped;
+
+  // 1 Hz utilisation sample for Safety Analytics, off while the clock is held
+  // or the tab is hidden; a resume books none of the gap.
+  useForkliftMetricsSampler(
+    data.id,
+    !simulationPaused && isTabVisible,
+    () => !effectiveStoppedRef.current
+  );
+
+  useEffect(() => {
+    if (!audioReady) return undefined;
+    audioManager.startForkliftEngine(data.id);
+    return () => audioManager.stopForkliftEngine(data.id);
+  }, [audioReady, data.id]);
+
+  useEffect(() => {
+    if (!audioReady) return;
+    audioManager.updateForkliftEngine(data.id, !motionStopped && !isOperating, effectiveStopped);
+  }, [audioReady, data.id, effectiveStopped, isOperating, motionStopped]);
+
+  // Lift and place sounds last the rest of the operation in real seconds at the
+  // current pace. They stop when the operation ends, the clock is held, an
+  // e-stop or drill freezes the cycle, or the forklift unmounts, and a release
+  // plays only what is left. A pace change mid-lift does not restart them.
+  const hydraulicHeld = simulationPaused || forkliftEmergencyStop || emergencyDrillMode;
+  useEffect(() => {
+    if (!audioReady) return undefined;
+    if (replayOperationRef.current === currentOperation) return undefined;
+    replayOperationRef.current = null;
+    if (hydraulicHeld || isWorkplaceReplayRestoring()) return undefined;
+    if (currentOperation !== 'loading' && currentOperation !== 'unloading') return undefined;
+    const seconds = hydraulicSoundSeconds(
+      (operationDurationRef.current || 1.5) - operationTimerRef.current,
+      useGameSimulationStore.getState().gameSpeed
+    );
+    if (seconds <= 0) return undefined;
+    if (currentOperation === 'loading') {
+      audioManager.playHydraulicLift(data.id, seconds);
+    } else {
+      audioManager.playHydraulicLower(data.id, seconds);
+    }
+    return () => audioManager.stopHydraulic(data.id);
+  }, [audioReady, currentOperation, data.id, hydraulicHeld]);
+
+  // Set initial position only once (not via prop to avoid reset on re-render)
+  const initializedRef = useRef(false);
+  useEffect(() => {
+    if (ref.current && !initializedRef.current) {
+      ref.current.position.set(...data.position);
+      initializedRef.current = true;
+    }
+  }, [data.position]);
+
+  // Cleanup: unregister from position registry on unmount
+  useEffect(() => {
+    return () => {
+      positionRegistry.unregister(data.id);
+      vehicleTelemetryRegistry.unregister(data.id);
+      crossingReservations.forEach((owner, crossingId) => {
+        if (owner === data.id) crossingReservations.delete(crossingId);
+      });
+    };
+  }, [data.id]);
+
+  const publishMotionTelemetry = (paused = false): void => {
+    const vehicle = ref.current;
+    if (!vehicle) return;
+    const motion = motionStateRef.current;
+    Object.assign(vehicle.userData, {
+      forkliftId: data.id,
+      type: 'forklift',
+      phase: operationRef.current,
+      loadPhase: loadPhaseRef.current,
+      speed: paused ? 0 : motion.speed,
+      acceleration: paused ? 0 : motion.acceleration,
+      steeringAngle: motion.steeringAngle,
+      innerSteeringAngle: motion.innerSteeringAngle,
+      outerSteeringAngle: motion.outerSteeringAngle,
+      wheelTravel: motion.wheelTravel,
+      routeDistance: motion.routeDistance,
+      stopReason: paused ? 'simulation-paused' : motion.stopReason,
+      forkHeight: forkHeightRef.current,
+      mastTilt: mastTiltRef.current,
+      cargo: hasCargoRef.current ? 'pallet' : 'empty',
+      stopped: paused || motion.stopReason !== 'none' || motion.speed <= 0.01,
+    });
+    const telemetry = telemetryRef.current;
+    telemetry.speedMps = paused ? 0 : motion.speed;
+    telemetry.steeringRadians = motion.steeringAngle;
+    telemetry.phase = loadPhaseRef.current;
+    telemetry.stopReason = paused ? 'simulation-paused' : motion.stopReason;
+    vehicleTelemetryRegistry.publish(telemetry);
+  };
+
+  const replayPresentationRef = useRef<() => void>(() => undefined);
+  replayPresentationRef.current = () => publishMotionTelemetry(true);
+  useEffect(
+    () =>
+      registerLogisticsVehicle(dock, {
+        prepare: (points) => {
+          const next = drivenLogisticsRoute(dock, points).plan;
+          const motion = reconcileLogisticsMotion(
+            routePlanRef.current,
+            next,
+            motionStateRef.current,
+            actionMarkerIndexRef.current
+          );
+          if (!motion)
+            return translate(forkliftSystemMessages, 'routeCornerAmbiguous', { id: data.id });
+          return () => {
+            routePlanRef.current = next;
+            motionStateRef.current = motion;
+            frameCountRef.current = 0;
+          };
+        },
+        restore: (points) => {
+          routePlanRef.current = drivenLogisticsRoute(dock, points).plan;
+        },
+      }),
+    [data.id, dock]
+  );
+
+  useEffect(
+    () =>
+      registerReplayParticipant(`forklift:${data.id}`, {
+        capture: () => ({
+          motionStateRef: motionStateRef.current,
+          actionMarkerIndexRef: actionMarkerIndexRef.current,
+          hasCargoRef: hasCargoRef.current,
+          operationRef: operationRef.current,
+          loadPhaseRef: loadPhaseRef.current,
+          stopReasonRef: stopReasonRef.current,
+          forkHeightRef: forkHeightRef.current,
+          mastTiltRef: mastTiltRef.current,
+          stateChangeTimerRef: stateChangeTimerRef.current,
+          frameCountRef: frameCountRef.current,
+          lastCollisionCheckRef: lastCollisionCheckRef.current,
+          crossingTimerRef: crossingTimerRef.current,
+          operationTimerRef: operationTimerRef.current,
+          operationDurationRef: operationDurationRef.current,
+          isInCrossingRef: isInCrossingRef.current,
+          currentSpeedRef: currentSpeedRef.current,
+          steeringAngleRef: steeringAngleRef.current,
+          innerSteeringAngleRef: innerSteeringAngleRef.current,
+          outerSteeringAngleRef: outerSteeringAngleRef.current,
+          stoppedMirrorRef: stoppedMirrorRef.current,
+          transform: ref.current
+            ? {
+                position: ref.current.position.toArray(),
+                rotation: [ref.current.rotation.x, ref.current.rotation.y, ref.current.rotation.z],
+              }
+            : null,
+        }),
+        restore: (snapshot) => {
+          motionStateRef.current = snapshot.motionStateRef;
+          actionMarkerIndexRef.current = snapshot.actionMarkerIndexRef;
+          // Not in the snapshot: re-earned on the restored leg.
+          actionCommittedRef.current = false;
+          hasCargoRef.current = snapshot.hasCargoRef;
+          operationRef.current = snapshot.operationRef;
+          loadPhaseRef.current = snapshot.loadPhaseRef;
+          stopReasonRef.current = snapshot.stopReasonRef;
+          forkHeightRef.current = snapshot.forkHeightRef;
+          mastTiltRef.current = snapshot.mastTiltRef;
+          stateChangeTimerRef.current = snapshot.stateChangeTimerRef;
+          frameCountRef.current = snapshot.frameCountRef;
+          lastCollisionCheckRef.current = snapshot.lastCollisionCheckRef;
+          crossingTimerRef.current = snapshot.crossingTimerRef;
+          operationTimerRef.current = snapshot.operationTimerRef;
+          operationDurationRef.current = snapshot.operationDurationRef;
+          isInCrossingRef.current = snapshot.isInCrossingRef;
+          currentSpeedRef.current = snapshot.currentSpeedRef;
+          steeringAngleRef.current = snapshot.steeringAngleRef;
+          innerSteeringAngleRef.current = snapshot.innerSteeringAngleRef;
+          outerSteeringAngleRef.current = snapshot.outerSteeringAngleRef;
+          stoppedMirrorRef.current = snapshot.stoppedMirrorRef;
+          // Derived, so not in the snapshot: mid-operation it follows the
+          // operation's progress, otherwise the cargo flag.
+          cargoPresenceRef.current =
+            operationRef.current === 'loading' || operationRef.current === 'unloading'
+              ? sampleForkliftLoadPose(
+                  operationRef.current === 'loading' ? 'pickup' : 'dropoff',
+                  operationTimerRef.current / Math.max(0.1, operationDurationRef.current),
+                  FORK_LIFT_HEIGHT
+                ).cargoPresence
+              : hasCargoRef.current
+                ? 1
+                : 0;
+          setHasCargo(hasCargoRef.current);
+          setCurrentOperation(operationRef.current);
+          setIsStopped(stoppedMirrorRef.current);
+          setIsInCrossing(isInCrossingRef.current);
+          replayOperationRef.current = operationRef.current;
+          if (ref.current) {
+            if (snapshot.transform) {
+              ref.current.position.fromArray(snapshot.transform.position);
+              ref.current.rotation.set(
+                ...(snapshot.transform.rotation as [number, number, number])
+              );
+            } else {
+              ref.current.position.x = motionStateRef.current.x;
+              ref.current.position.z = motionStateRef.current.z;
+              ref.current.rotation.y = motionStateRef.current.heading;
+            }
+            ref.current.updateMatrixWorld(true);
+            const motion = motionStateRef.current;
+            const [dirX, dirZ] = routeDirection(routePlanRef.current, motion.routeDistance);
+            dirNormalizedRef.current.set(dirX, 0, dirZ);
+            positionRegistry.register(
+              data.id,
+              motion.x,
+              motion.z,
+              dirX,
+              dirZ,
+              true,
+              ref.current.position.y
+            );
+          }
+          replayPresentationRef.current();
+        },
+      }),
+    [data.id]
+  );
+
+  useFrame((state, delta) => {
+    if (!ref.current || !isTabVisible) return;
+    const routePlan = routePlanRef.current;
+
+    const wallDelta = Math.min(Math.max(delta, 1 / 240), 0.1);
+    const simulationDelta = wallDelta * plantTimeScale(useGameSimulationStore.getState().gameSpeed);
+    const vehicle = ref.current;
+    const motionBefore = motionStateRef.current;
+
+    if (audioReady && shouldRunThisFrame(4)) {
+      // Engine height; the loop then follows camera distance and walls.
+      audioManager.registerSoundPosition(
+        data.id,
+        vehicle.position.x,
+        vehicle.position.y + 1,
+        vehicle.position.z
+      );
+      audioManager.updateForkliftSpatialVolume(data.id);
+    }
+
+    cameraDistanceRef.current = state.camera.position.distanceTo(vehicle.position);
+    const labelGroup = labelGroupRef.current;
+    // Replay and headless frames can pass a state without size or viewport;
+    // leave the tag as it is rather than reading through undefined.
+    const renderRows = (state.size?.height ?? 0) * (state.viewport?.dpr ?? 1);
+    if (labelGroup && renderRows > 0) {
+      labelGroup.visible = sceneTextLegible(
+        FORKLIFT_LABEL_FONT_SIZE,
+        cameraDistanceRef.current,
+        renderRows,
+        (state.camera as THREE.PerspectiveCamera).fov ?? 50,
+        labelGroup.visible
+      );
+    }
+    if (distanceTier === 'close' && cameraDistanceRef.current > FORKLIFT_LOD_FAR_METRES) {
+      setDistanceTier('far');
+    } else if (distanceTier === 'far' && cameraDistanceRef.current < FORKLIFT_LOD_CLOSE_METRES) {
+      setDistanceTier('close');
+    }
+
+    const framePaused = isForkliftSimulationPaused(useGameSimulationStore.getState().gameSpeed);
+    if (framePaused || isWorkplaceReplayRestoring()) {
+      const [dirX, dirZ] = routeDirection(routePlan, motionBefore.routeDistance);
+      dirNormalizedRef.current.set(dirX, 0, dirZ);
+      positionRegistry.register(
+        data.id,
+        motionBefore.x,
+        motionBefore.z,
+        dirX,
+        dirZ,
+        true,
+        vehicle.position.y
+      );
+      publishMotionTelemetry(true);
+      return;
+    }
+
+    const [currentDirX, currentDirZ] = routeDirection(routePlan, motionBefore.routeDistance);
+    const direction = dirNormalizedRef.current.set(currentDirX, 0, currentDirZ);
+    frameCountRef.current += 1;
+    const shouldCheckCollisions = frameCountRef.current % 3 === 0;
+    let pathClear: boolean;
+    let obstaclePathClear: boolean;
+    let forkliftsNearby: EntityPosition[];
+
+    if (shouldCheckCollisions) {
+      // Operator clearances from the Safety Config sliders (read, not subscribed).
+      const clearance = useSafetyStore.getState().safetyConfig;
+      pathClear = positionRegistry.isPathClear(
+        motionBefore.x,
+        motionBefore.z,
+        direction.x,
+        direction.z,
+        clearance.pathCheckDistance,
+        clearance.vehicleDetectionRadius,
+        data.id,
+        true,
+        vehicle.position.y,
+        (distanceAhead) =>
+          sampleArcLengthPath(routePlan.path, motionBefore.routeDistance + distanceAhead)
+      );
+      obstaclePathClear = positionRegistry.isObstaclePathClear(
+        motionBefore.x,
+        motionBefore.z,
+        direction.x,
+        direction.z,
+        clearance.pathCheckDistance,
+        clearance.vehicleDetectionRadius,
+        (distanceAhead) =>
+          sampleArcLengthPath(routePlan.path, motionBefore.routeDistance + distanceAhead)
+      );
+      forkliftsNearby = positionRegistry.getForkliftsNearby(
+        motionBefore.x,
+        motionBefore.z,
+        clearance.forkliftSafetyRadius,
+        data.id,
+        vehicle.position.y
+      );
+      lastCollisionCheckRef.current = { pathClear, obstaclePathClear, forkliftsNearby };
+    } else {
+      ({ pathClear, obstaclePathClear, forkliftsNearby } = lastCollisionCheckRef.current);
+    }
+
+    const currentCrossingZone = isInCrossingZone(motionBefore.x, motionBefore.z);
+    const crossingLookAhead = sampleArcLengthPath(
+      routePlan.path,
+      motionBefore.routeDistance + CROSSING_APPROACH_DISTANCE
+    );
+    const approachingCrossingZone = isInCrossingZone(crossingLookAhead.x, crossingLookAhead.z);
+    const activeCrossing = currentCrossingZone ?? approachingCrossingZone;
+    let crossingClear = true;
+    let crossingSpeedLimit = Infinity;
+
+    if (activeCrossing) {
+      const owner = crossingReservations.get(activeCrossing.id);
+      const ownsReservation = owner === data.id;
+      if (currentCrossingZone) {
+        if (!owner) crossingReservations.set(activeCrossing.id, data.id);
+        crossingClear = !owner || ownsReservation;
+        crossingSpeedLimit = 1.2;
+        crossingTimerRef.current = 0;
+      } else if (owner && !ownsReservation) {
+        crossingClear = false;
+        crossingTimerRef.current = 0;
+      } else {
+        crossingTimerRef.current += simulationDelta;
+        crossingClear = crossingTimerRef.current >= CROSSING_WAIT_TIME;
+        crossingSpeedLimit = 1;
+        if (crossingClear) crossingReservations.set(activeCrossing.id, data.id);
+      }
+    } else {
+      crossingReservations.forEach((owner, crossingId) => {
+        if (owner === data.id) crossingReservations.delete(crossingId);
+      });
+      crossingTimerRef.current = 0;
+    }
+    const inCrossing = activeCrossing !== null;
+    if (inCrossing !== isInCrossingRef.current) {
+      isInCrossingRef.current = inCrossing;
+      setIsInCrossing(inCrossing);
+    }
+
+    const marker = routePlan.markers[actionMarkerIndexRef.current];
+    const markerAction =
+      marker?.action.type === 'pickup' || marker?.action.type === 'dropoff'
+        ? marker.action.type
+        : null;
+    const markerRelevant =
+      markerAction === 'pickup'
+        ? !hasCargoRef.current
+        : markerAction === 'dropoff'
+          ? hasCargoRef.current
+          : false;
+    const distanceToMarker = marker
+      ? distanceAheadOnClosedPath(routePlan.path, motionBefore.routeDistance, marker.distance)
+      : Infinity;
+
+    // An e-stop or drill freezes a lift/place cycle where it is, as well as travel.
+    const emergencyStopped = forkliftEmergencyStop || emergencyDrillMode;
+
+    if (operationRef.current === 'loading' || operationRef.current === 'unloading') {
+      if (emergencyStopped) {
+        stopReasonRef.current = 'emergency-stop';
+        motionStateRef.current = {
+          ...motionBefore,
+          speed: 0,
+          acceleration: 0,
+          stopReason: 'emergency-stop',
+        };
+        currentSpeedRef.current = 0;
+        positionRegistry.register(
+          data.id,
+          motionBefore.x,
+          motionBefore.z,
+          direction.x,
+          direction.z,
+          true,
+          vehicle.position.y
+        );
+        publishMotionTelemetry();
+        return;
+      }
+      operationTimerRef.current += simulationDelta;
+      const duration = Math.max(0.1, operationDurationRef.current);
+      const action = operationRef.current === 'loading' ? 'pickup' : 'dropoff';
+      const loadPose = sampleForkliftLoadPose(
+        action,
+        operationTimerRef.current / duration,
+        FORK_LIFT_HEIGHT,
+        marker?.action.surfaceForkHeight ?? 0
+      );
+      loadPhaseRef.current = loadPose.phase;
+      forkHeightRef.current = loadPose.forkHeight;
+      mastTiltRef.current = loadPose.mastTilt;
+      cargoPresenceRef.current = loadPose.cargoPresence;
+      stopReasonRef.current = 'load-operation';
+
+      if (action === 'pickup' && loadPose.cargoEngaged && !hasCargoRef.current) {
+        hasCargoRef.current = true;
+        setHasCargo(true);
+      } else if (action === 'dropoff' && !loadPose.cargoEngaged && hasCargoRef.current) {
+        hasCargoRef.current = false;
+        setHasCargo(false);
+      }
+
+      motionStateRef.current = {
+        ...motionBefore,
+        speed: 0,
+        acceleration: 0,
+        stopReason: 'load-operation',
+      };
+      currentSpeedRef.current = 0;
+      positionRegistry.register(
+        data.id,
+        motionBefore.x,
+        motionBefore.z,
+        direction.x,
+        direction.z,
+        true,
+        vehicle.position.y
+      );
+
+      if (loadPose.operationComplete) {
+        if (action === 'dropoff') useLogisticsLayoutStore.getState().recordVehicle(dock, 0, true);
+        operationTimerRef.current = 0;
+        operationRef.current = 'traveling';
+        loadPhaseRef.current = hasCargoRef.current ? 'carrying' : 'idle';
+        setCurrentOperation('traveling');
+        actionMarkerIndexRef.current =
+          routePlan.markers.length > 0
+            ? (actionMarkerIndexRef.current + 1) % routePlan.markers.length
+            : 0;
+        // A raised surface keeps the forks at its height until the vehicle has backed off.
+        forkHeightRef.current = travelForkHeight(
+          routePlan,
+          motionBefore.routeDistance,
+          hasCargoRef.current
+        );
+        mastTiltRef.current = resolveForkliftMastTilt('traveling', hasCargoRef.current);
+      }
+      publishMotionTelemetry();
+      return;
+    }
+
+    // Not yet permitted, the forklift waits at the marker's hold point: short of
+    // the dock door's pedestrian approach for a dock-side action.
+    // Once it has left the hold point with permission it finishes the action
+    // while its truck is still docked, rather than stopping in the doorway.
+    const holdLeg = markerHoldLegs(routePlan)[actionMarkerIndexRef.current] ?? 0;
+    const ownPermission = markerAction ? canPerformWaypointAction(markerAction) : false;
+    actionCommittedRef.current =
+      markerRelevant &&
+      nextForkliftActionCommitment({
+        committed: actionCommittedRef.current,
+        permitted: ownPermission,
+        distanceToMarker,
+        holdLeg,
+      });
+    const actionPermitted = forkliftActionPermitted({
+      permitted: ownPermission,
+      committed: actionCommittedRef.current,
+      truckAtDock: truckTransferReady[dock],
+    });
+    const actionStop =
+      marker && markerRelevant && markerAction
+        ? resolveForkliftActionStop({ distanceToMarker, holdLeg, permitted: actionPermitted })
+        : null;
+    const logisticsInterlock = !emergencyStopped && (actionStop?.interlocked ?? false);
+    if (marker && markerRelevant && distanceToMarker <= 0.06 && markerAction && !emergencyStopped) {
+      if (actionPermitted) {
+        const markerSample = sampleArcLengthPath(routePlan.path, marker.distance);
+        motionStateRef.current = {
+          ...motionBefore,
+          routeDistance: marker.distance,
+          x: markerSample.x,
+          z: markerSample.z,
+          speed: 0,
+          acceleration: 0,
+          stopReason: 'load-operation',
+        };
+        vehicle.position.x = markerSample.x;
+        vehicle.position.z = markerSample.z;
+        operationTimerRef.current = 0;
+        operationDurationRef.current = marker.action.duration;
+        operationRef.current = markerAction === 'pickup' ? 'loading' : 'unloading';
+        loadPhaseRef.current = 'aligning';
+        setCurrentOperation(operationRef.current);
+        currentSpeedRef.current = 0;
+        publishMotionTelemetry();
+        return;
+      }
+    }
+
+    const stopReason = resolveForkliftStopReason({
+      id: data.id,
+      emergencyStopped,
+      crossingClear,
+      logisticsInterlock,
+      pathClear,
+      obstaclePathClear,
+      nearby: forkliftsNearby,
+    });
+
+    const requestedStopped = stopReason !== 'none';
+    if (requestedStopped !== isStopped) {
+      stateChangeTimerRef.current += wallDelta;
+      if (stateChangeTimerRef.current >= HYSTERESIS_TIME) {
+        setIsStopped(requestedStopped);
+        stateChangeTimerRef.current = 0;
+        // Only a genuine static obstruction is a near-miss. Commanded waits
+        // (crossing reservation, logistics interlock, e-stop or drill) and
+        // queuing behind another vehicle keep the red beacon but neither sound
+        // the horn nor reset Days Safe. A planned yield to a nearby vehicle
+        // sounds the horn as a courtesy, but it is routine fleet priority, not
+        // a near miss.
+        // Working if a yield never raises 'Near-Miss Avoided' or lowers the
+        // safety score, while a blocked route still records one.
+        if (stopReason === 'route-blocked' || stopReason === 'vehicle-yield') {
+          audioManager.playHorn(data.id);
+        }
+        if (stopReason === 'route-blocked') {
+          recordSafetyStop();
+          useSafetyStore
+            .getState()
+            .recordIncidentLocation(vehicle.position.x, vehicle.position.z, 'stop');
+        }
+      }
+    } else {
+      stateChangeTimerRef.current = 0;
+    }
+
+    let targetSpeed = data.speed * vehicleSpeedMultiplier;
+    targetSpeed = Math.min(targetSpeed, crossingSpeedLimit);
+    if (actionStop && actionStop.stopDistance < 5) {
+      const brakingSpeed = Math.sqrt(Math.max(0, 2 * 1.5 * (actionStop.stopDistance - 0.03)));
+      targetSpeed = Math.min(targetSpeed, brakingSpeed);
+    }
+
+    const nextMotion = stepForkliftMotion(motionBefore, routePlan, {
+      targetSpeed,
+      stopReason,
+      loaded: hasCargoRef.current,
+      deltaSeconds: simulationDelta,
+      maximumTravelDistance: actionStop?.stopDistance,
+      // Held short of a pickup or dropoff it has not worked: keep facing along
+      // the lane, or the bay or trailer at the marker itself.
+      holdHeading: logisticsInterlock,
+    });
+    useLogisticsLayoutStore
+      .getState()
+      .recordVehicle(dock, Math.max(0, nextMotion.wheelTravel - motionBefore.wheelTravel));
+    motionStateRef.current = nextMotion;
+    stopReasonRef.current = stopReason;
+    currentSpeedRef.current = nextMotion.speed;
+    steeringAngleRef.current = nextMotion.steeringAngle;
+    innerSteeringAngleRef.current = nextMotion.innerSteeringAngle;
+    outerSteeringAngleRef.current = nextMotion.outerSteeringAngle;
+    loadPhaseRef.current = hasCargoRef.current ? 'carrying' : 'idle';
+    cargoPresenceRef.current = hasCargoRef.current ? 1 : 0;
+
+    const poseResponse = 1 - Math.exp(-7 * simulationDelta);
+    const nextSample = sampleArcLengthPath(routePlan.path, nextMotion.routeDistance);
+    const lateralAcceleration = nextSample.curvature * nextMotion.speed * nextMotion.speed;
+    const targetRoll = THREE.MathUtils.clamp(-lateralAcceleration * 0.012, -0.045, 0.045);
+    const targetPitch = THREE.MathUtils.clamp(-nextMotion.acceleration * 0.008, -0.025, 0.025);
+    vehicle.position.x = nextMotion.x;
+    vehicle.position.z = nextMotion.z;
+    vehicle.rotation.y = nextMotion.heading;
+    vehicle.rotation.z += (targetRoll - vehicle.rotation.z) * poseResponse;
+    vehicle.rotation.x += (targetPitch - vehicle.rotation.x) * poseResponse;
+    forkHeightRef.current +=
+      (travelForkHeight(routePlan, nextMotion.routeDistance, hasCargoRef.current) -
+        forkHeightRef.current) *
+      poseResponse;
+    mastTiltRef.current +=
+      (resolveForkliftMastTilt('traveling', hasCargoRef.current) - mastTiltRef.current) *
+      poseResponse;
+
+    const [nextDirX, nextDirZ] = routeDirection(routePlan, nextMotion.routeDistance);
+    positionRegistry.register(
+      data.id,
+      nextMotion.x,
+      nextMotion.z,
+      nextDirX,
+      nextDirZ,
+      requestedStopped || nextMotion.speed <= 0.01,
+      vehicle.position.y
+    );
+    publishMotionTelemetry();
+  });
+
+  // Handle click on forklift
+  const handleClick = (e: { stopPropagation: () => void }) => {
+    e.stopPropagation();
+    if (onSelect && ref.current) {
+      const status =
+        currentOperation === 'loading'
+          ? 'loading'
+          : currentOperation === 'unloading'
+            ? 'unloading'
+            : motionStopped
+              ? 'idle'
+              : 'moving';
+      onSelect({
+        id: data.id,
+        cargo: hasCargo ? 'pallet' : 'empty',
+        position: [ref.current.position.x, ref.current.position.y, ref.current.position.z],
+        rotation: ref.current.rotation.y,
+        status,
+      });
+    }
+  };
+
+  // Visual content for the forklift
+  const forkliftContent = (
+    <group
+      ref={ref}
+      name={data.id}
+      onClick={handleClick}
+      onPointerOver={() => (document.body.style.cursor = 'pointer')}
+      onPointerOut={() => (document.body.style.cursor = 'auto')}
+    >
+      {/* Forklift model - full detail when close, billboard when far */}
+      {distanceTier === 'close' ? (
+        <ForkliftModel
+          cargoPresenceRef={cargoPresenceRef}
+          isMoving={!motionStopped && !isOperating}
+          forkHeightRef={forkHeightRef}
+          mastTiltRef={mastTiltRef}
+          steeringAngleRef={steeringAngleRef}
+          innerSteeringAngleRef={innerSteeringAngleRef}
+          outerSteeringAngleRef={outerSteeringAngleRef}
+          grime={forkliftGrime}
+        />
+      ) : (
+        <ForkliftBillboard cargoPresenceRef={cargoPresenceRef} />
+      )}
+
+      {/* Warning light - always mounted so the point-light count is constant;
+          its housing and wedge are drawn only in the close tier. The compact
+          (low) model's roof is at 2.13 m, so the 0.15 m housing centres at 2.205. */}
+      <WarningLight
+        isStopped={effectiveStopped}
+        isInCrossing={isInCrossing}
+        simulationPaused={simulationPaused}
+        height={FORKLIFT_BEACON.mountHeight[authoredVehicleVisual ? 'authored' : 'compact']}
+        showGeometry={distanceTier === 'close'}
+      />
+
+      {/* Fleet identity and operation status, rendered only when close */}
+      {distanceTier === 'close' && (
+        <Billboard
+          ref={labelGroupRef}
+          position={[
+            0,
+            forkliftBeaconLabelHeight(authoredVehicleVisual ? 'authored' : 'compact'),
+            0,
+          ]}
+          follow
+        >
+          <Text
+            fontSize={FORKLIFT_LABEL_FONT_SIZE}
+            color="white"
+            anchorX="center"
+            anchorY="middle"
+            outlineWidth={0.02}
+            outlineColor="#000"
+          >
+            {displayLabel
+              ? t('fleetLabel', { tag: displayLabel.tag, role: t(displayLabel.role) })
+              : data.id}
+          </Text>
+          {/* Show operation status when loading/unloading */}
+          {isOperating && (
+            <Text
+              position={[0, 0.24, 0]}
+              fontSize={0.14}
+              color={currentOperation === 'loading' ? '#22c55e' : '#f59e0b'}
+              anchorX="center"
+              anchorY="middle"
+              outlineWidth={0.02}
+              outlineColor="#000"
+            >
+              {currentOperation === 'loading' ? t('operationLoading') : t('operationUnloading')}
+            </Text>
+          )}
+        </Billboard>
+      )}
+    </group>
+  );
+
+  return forkliftContent;
+};

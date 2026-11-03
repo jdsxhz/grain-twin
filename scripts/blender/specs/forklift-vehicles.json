@@ -1,0 +1,180 @@
+[
+ {
+  "name": "compactWheel",
+  "note": "CompactForklift tyre. CylinderGeometry(0.32,0.32,0.24,20) - a plain drum, drawn through a 4-instance InstancedMesh and the ONLY round silhouette on an otherwise all-box model. Redesign as a cushion tyre on a recessed steel rim: near-full-width flat tread, tight shoulder round-over in the outer 55 mm, a flat bead sidewall, a rim flange at the widest axial face, and a dished hub pan with a centre boss. Envelope pinned: max radius 0.320 (the spin integrator's divisor AND the ground-contact radius), y half-extent 0.120.",
+  "before": { "kind": "cylinder", "args": [0.32, 0.32, 0.24, 20] },
+  "after": {
+   "kind": "profile",
+   "segments": 20,
+   "points": [
+    [0.0000, -0.0840],
+    [0.0620, -0.0840],
+    [0.0760, -0.1060],
+    [0.1300, -0.1060],
+    [0.1480, -0.1200],
+    [0.2500, -0.1200],
+    [0.2960, -0.1110],
+    [0.3150, -0.0900],
+    [0.3200, -0.0640],
+    [0.3200, 0.0640],
+    [0.3150, 0.0900],
+    [0.2960, 0.1110],
+    [0.2500, 0.1200],
+    [0.1480, 0.1200],
+    [0.1300, 0.1060],
+    [0.0760, 0.1060],
+    [0.0620, 0.0840],
+    [0.0000, 0.0840]
+   ]
+  },
+  "scale": [1, 1, 1],
+  "distance": 1.8
+ },
+ {
+  "name": "compactWheelTreadStudy",
+  "note": "A/B on tread width only, both with the same hub pan and rim flange. BEFORE holds full radius over just +/-20 mm (a balloon/motorcycle section); AFTER holds it over +/-64 mm (a cushion-tyre section). Same envelope, same vertex count - this decides which one a forklift actually has.",
+  "before": {
+   "kind": "profile",
+   "segments": 20,
+   "points": [
+    [0.0000, -0.0840],
+    [0.0620, -0.0840],
+    [0.0760, -0.1060],
+    [0.1300, -0.1060],
+    [0.1460, -0.1200],
+    [0.2460, -0.1200],
+    [0.2920, -0.1010],
+    [0.3150, -0.0580],
+    [0.3200, -0.0200],
+    [0.3200, 0.0200],
+    [0.3150, 0.0580],
+    [0.2920, 0.1010],
+    [0.2460, 0.1200],
+    [0.1460, 0.1200],
+    [0.1300, 0.1060],
+    [0.0760, 0.1060],
+    [0.0620, 0.0840],
+    [0.0000, 0.0840]
+   ]
+  },
+  "after": {
+   "kind": "profile",
+   "segments": 20,
+   "points": [
+    [0.0000, -0.0840],
+    [0.0620, -0.0840],
+    [0.0760, -0.1060],
+    [0.1300, -0.1060],
+    [0.1480, -0.1200],
+    [0.2500, -0.1200],
+    [0.2960, -0.1110],
+    [0.3150, -0.0900],
+    [0.3200, -0.0640],
+    [0.3200, 0.0640],
+    [0.3150, 0.0900],
+    [0.2960, 0.1110],
+    [0.2500, 0.1200],
+    [0.1480, 0.1200],
+    [0.1300, 0.1060],
+    [0.0760, 0.1060],
+    [0.0620, 0.0840],
+    [0.0000, 0.0840]
+   ]
+  },
+  "scale": [1, 1, 1],
+  "distance": 1.8
+ },
+ {
+  "name": "compactWheelAt8m",
+  "note": "Same swap, framed at 8 m - the distance a walking camera passes a forklift. The bar is that the shoulder round-over and hub pan still read here, not just in a close-up.",
+  "before": { "kind": "cylinder", "args": [0.32, 0.32, 0.24, 20] },
+  "after": {
+   "kind": "profile",
+   "segments": 20,
+   "points": [
+    [0.0000, -0.0840],
+    [0.0620, -0.0840],
+    [0.0760, -0.1060],
+    [0.1300, -0.1060],
+    [0.1480, -0.1200],
+    [0.2500, -0.1200],
+    [0.2960, -0.1110],
+    [0.3150, -0.0900],
+    [0.3200, -0.0640],
+    [0.3200, 0.0640],
+    [0.3150, 0.0900],
+    [0.2960, 0.1110],
+    [0.2500, 0.1200],
+    [0.1480, 0.1200],
+    [0.1300, 0.1060],
+    [0.0760, 0.1060],
+    [0.0620, 0.0840],
+    [0.0000, 0.0840]
+   ]
+  },
+  "scale": [1, 1, 1],
+  "distance": 8.0
+ },
+ {
+  "name": "compactBeacon",
+  "note": "CompactForklift rotating beacon. CylinderGeometry(0.08,0.08,0.13,10) - a flat-topped drum at y=2.19, the highest point on the vehicle and the one part read against open sky. The cab roof top is at y=2.13, i.e. local y=-0.06, so everything below that is buried and any detail spent there is invisible; and at in-scene distance the whole lamp is under ten pixels tall, so fresnel rings would be a mathematical no-op. The budget is the SILHOUETTE above the roof line: a narrow mounting collar, a lens skirt flaring to full radius, a straight barrel, and a dome. Envelope pinned: max radius 0.080, y half-extent 0.065.",
+  "before": { "kind": "cylinder", "args": [0.08, 0.08, 0.13, 10] },
+  "after": {
+   "kind": "profile",
+   "segments": 10,
+   "points": [
+    [0.0000, -0.0650],
+    [0.0620, -0.0650],
+    [0.0680, -0.0560],
+    [0.0680, -0.0400],
+    [0.0800, -0.0330],
+    [0.0800, 0.0120],
+    [0.0740, 0.0300],
+    [0.0570, 0.0480],
+    [0.0310, 0.0605],
+    [0.0000, 0.0650]
+   ]
+  },
+  "scale": [1, 1, 1],
+  "distance": 0.55
+ },
+ {
+  "name": "compactSteeringWheelREJECTED",
+  "note": "DESIGNED, RENDERED, REJECTED - the TypeScript is deliberately left as TorusGeometry(0.13,0.018,6,14). BEFORE here is the exact lathe equivalent of that torus (tube section sampled at the same six angles), so both variants are measured in one axis frame. AFTER is the second of two dished-wheel designs: v1 put a conical spoke web level with the rim, v2 (this one) drops the web to a flat plate 28 mm behind the rim front with a proud hub cap. BOTH render as a solid lid, not a wheel - a steering wheel's defining features are its spokes, its hub and the OPEN sectors between them, and none of those is a surface of revolution. The envelope makes it worse: 0.148 radius against 0.0156 half-thickness is 1:19, so no lathe dish is deep enough to separate rim from web, and LatheGeometry's normals are averaged along the whole profile, which blurs the one step that might have read. The hoop at least keeps the hole, which is the wheel's entire silhouette. Anything better needs a hand-built spoked BufferGeometry, which is out of proportion for a 0.3 m part seen through 0.5-opacity glass on the low-quality LOD only.",
+  "before": {
+   "kind": "profile",
+   "segments": 14,
+   "points": [
+    [0.148, 0.0],
+    [0.139, 0.015588],
+    [0.121, 0.015588],
+    [0.112, 0.0],
+    [0.121, -0.015588],
+    [0.139, -0.015588],
+    [0.148, 0.0]
+   ]
+  },
+  "after": {
+   "kind": "profile",
+   "segments": 14,
+   "points": [
+    [0.0000, 0.0090],
+    [0.0280, 0.0090],
+    [0.0330, 0.0130],
+    [0.1230, 0.0130],
+    [0.1310, 0.0020],
+    [0.1370, -0.0110],
+    [0.1430, -0.015588],
+    [0.1480, -0.0060],
+    [0.1450, 0.0080],
+    [0.1370, 0.0150],
+    [0.1250, 0.015588],
+    [0.0330, 0.015588],
+    [0.0270, 0.0140],
+    [0.0000, 0.0140]
+   ]
+  },
+  "scale": [1, 1, 1],
+  "distance": 0.85
+ }
+]

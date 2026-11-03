@@ -1,0 +1,1022 @@
+import { describe, expect, it, vi } from 'vitest';
+import { beginStartupTask, getStartupSnapshot } from '../../utils/startupReadiness';
+import * as THREE from 'three';
+import {
+  beginStaticBatch,
+  finishStaticBatch,
+  collectStaticBatchCandidates,
+  createStaticMeshBatches,
+  orderStaticBatchCandidatesForChunking,
+} from './StaticMeshBatch';
+import {
+  applyBatchWorldSurface,
+  applyDeclinedWorldSurface,
+  pinnedSurfaceProfile,
+  applyWorldSurface,
+  hasWorldSurface,
+  pinSurfaceProfile,
+} from '../../utils/worldSurface';
+import { SURFACE_WETNESS } from '../../shaders/surfaceWetness';
+import {
+  YARD_TARMAC_SURFACE,
+  APRON_CONCRETE_SURFACE,
+  ROAD_TARMAC_SURFACE,
+} from '../truckbay/yardSurfaces';
+import { applyLampLens, lampLensStyle, LAMP_LENS_HEIGHTS } from '../models/GeneratedLampModel';
+import { EXTERIOR_LAMP_LENS_MATERIAL } from '../exterior/ExteriorLighting';
+import { applyCivicLampShadows, CIVIC_SHADOW_ATLAS } from '../../shaders/civicLampShadows';
+
+const makeBox = (x: number, color: string = '#778899'): THREE.Mesh => {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 2, 3),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.7 })
+  );
+  mesh.position.x = x;
+  return mesh;
+};
+
+describe('StaticMeshBatch', () => {
+  it('reports batching as startup work and releases only its own task once', () => {
+    const baseline = getStartupSnapshot().pendingTasks;
+    const finishOther = beginStartupTask();
+    const first = beginStaticBatch();
+    const second = beginStaticBatch();
+    try {
+      expect(getStartupSnapshot().pendingTasks).toBe(baseline + 3);
+      expect(document.documentElement.dataset.millosStaticBatchesPending).toBe('2');
+      finishStaticBatch(first);
+      finishStaticBatch(first);
+      expect(getStartupSnapshot().pendingTasks).toBe(baseline + 2);
+      expect(document.documentElement.dataset.millosStaticBatchesPending).toBe('1');
+      finishStaticBatch(second);
+      expect(getStartupSnapshot().pendingTasks).toBe(baseline + 1);
+      expect(document.documentElement.dataset.millosStaticBatchesPending).toBe('0');
+    } finally {
+      finishStaticBatch(first);
+      finishStaticBatch(second);
+      finishOther();
+    }
+    expect(getStartupSnapshot().pendingTasks).toBe(baseline);
+  });
+
+  it('batches mapped bodies without automatically overpainting their atlas', () => {
+    const root = new THREE.Group();
+    const map = new THREE.Texture();
+    const normalMap = new THREE.Texture();
+    const geometry = new THREE.BoxGeometry(1, 2, 3);
+    const material = new THREE.MeshStandardMaterial({ map, normalMap, roughness: 1 });
+    root.add(new THREE.Mesh(geometry, material), new THREE.Mesh(geometry, material.clone()));
+    root.children[1].position.x = 3;
+    const candidates = collectStaticBatchCandidates(root, true);
+    const batches = createStaticMeshBatches(root, candidates, 'atlas', 2, applyBatchWorldSurface);
+    expect(batches).toHaveLength(1);
+    const output = batches[0].mesh.material as THREE.MeshStandardMaterial;
+    expect(output.map).toBe(map);
+    expect(output.normalMap).toBe(normalMap);
+    expect(hasWorldSurface(output)).toBe(false);
+    expect(output.onBeforeCompile).toBe(THREE.Material.prototype.onBeforeCompile);
+  });
+
+  it('instances both lamp styles separately without baking their lens coordinates or losing glow', () => {
+    const root = new THREE.Group();
+    root.position.set(10, 2, -4);
+    root.rotation.y = Math.PI / 2;
+    const geometry = new THREE.BoxGeometry(0.4, 4.5, 0.4);
+    const originalPositions = new Float32Array(geometry.getAttribute('position').array);
+    const atlas = CIVIC_SHADOW_ATLAS.value;
+    const intensity = EXTERIOR_LAMP_LENS_MATERIAL.emissiveIntensity;
+    CIVIC_SHADOW_ATLAS.value = new THREE.Texture();
+    try {
+      for (const style of ['modern', 'victorian'] as const) {
+        for (let i = 0; i < 4; i++) {
+          const material = new THREE.MeshStandardMaterial({ color: '#aabbee', roughness: 0.8 });
+          applyLampLens(material, style);
+          applyCivicLampShadows(material);
+          const mesh = new THREE.Mesh(geometry, material);
+          mesh.position.set(i * 12, i * 3, style === 'modern' ? 0 : 5);
+          mesh.castShadow = mesh.receiveShadow = true;
+          root.add(mesh);
+        }
+      }
+      const candidates = collectStaticBatchCandidates(root, true);
+      expect(candidates).toHaveLength(8);
+      const batches = createStaticMeshBatches(root, candidates, 'lamps', 2, applyBatchWorldSurface);
+      expect(batches).toHaveLength(2);
+      expect(new Set(batches.map((batch) => batch.mesh.userData.staticBatchLampStyle))).toEqual(
+        new Set(['modern', 'victorian'])
+      );
+      for (const batch of batches) {
+        const mesh = batch.mesh as THREE.InstancedMesh;
+        const style = lampLensStyle(mesh.material as THREE.Material)!;
+        expect(mesh.isInstancedMesh).toBe(true);
+        expect(mesh.count).toBe(4);
+        expect(mesh.geometry).toBe(geometry);
+        expect(batch.ownsGeometry).toBe(false);
+        expect(batch.ownsMaterial).toBe(true);
+        expect(mesh.castShadow && mesh.receiveShadow).toBe(true);
+        expect(hasWorldSurface(mesh.material as THREE.Material)).toBe(false);
+        const material = mesh.material as THREE.MeshStandardMaterial;
+        expect(material).not.toBe(batch.originals[0].mesh.material);
+        const shader = {
+          uniforms: {},
+          vertexShader: THREE.ShaderLib.standard.vertexShader,
+          fragmentShader: THREE.ShaderLib.standard.fragmentShader,
+        } as THREE.WebGLProgramParametersWithUniforms;
+        material.onBeforeCompile(shader, {} as THREE.WebGLRenderer);
+        expect(shader.vertexShader).toContain('vLampRestHeight = position.y');
+        expect(shader.uniforms.lampLensHeights.value.toArray()).toEqual(LAMP_LENS_HEIGHTS[style]);
+        expect(shader.uniforms.civicDepthAtlas.value).toBe(CIVIC_SHADOW_ATLAS.value);
+        expect(
+          shader.fragmentShader.match(/totalEmissiveRadiance \+= lampLensColor/g)
+        ).toHaveLength(1);
+        expect(shader.uniforms.lampLensColor.value).toBe(EXTERIOR_LAMP_LENS_MATERIAL.emissive);
+        EXTERIOR_LAMP_LENS_MATERIAL.emissiveIntensity = 0.25;
+        expect(shader.uniforms.lampLensStrength.value).toBe(0.25);
+        EXTERIOR_LAMP_LENS_MATERIAL.emissiveIntensity = 2.5;
+        expect(shader.uniforms.lampLensStrength.value).toBe(2.5);
+        for (const [index, original] of batch.originals.entries()) {
+          expect(original.parent).toBe(root);
+          const actual = new THREE.Matrix4();
+          mesh.getMatrixAt(index, actual);
+          actual.elements.forEach((value, i) =>
+            expect(value).toBeCloseTo(original.mesh.matrix.elements[i], 5)
+          );
+          const color = new THREE.Color();
+          mesh.getColorAt(index, color);
+          expect(color.r).toBeCloseTo(
+            (original.mesh.material as THREE.MeshStandardMaterial).color.r
+          );
+        }
+      }
+      expect(geometry.getAttribute('position').array).toEqual(originalPositions);
+    } finally {
+      CIVIC_SHADOW_ATLAS.value?.dispose();
+      CIVIC_SHADOW_ATLAS.value = atlas;
+      EXTERIOR_LAMP_LENS_MATERIAL.emissiveIntensity = intensity;
+    }
+  });
+
+  it('rejects spoofed, transparent and asynchronously tampered lamp hooks', () => {
+    const root = new THREE.Group();
+    const original = makeBox(1);
+    const material = original.material as THREE.MeshStandardMaterial;
+    applyLampLens(material, 'modern');
+    root.add(original);
+    const candidates = collectStaticBatchCandidates(root);
+    expect(candidates).toHaveLength(1);
+    material.onBeforeCompile = () => undefined;
+    expect(lampLensStyle(material)).toBeNull();
+    expect(createStaticMeshBatches(root, candidates, 'tampered', 1)).toHaveLength(0);
+
+    const forged = makeBox(2);
+    const forgedMaterial = forged.material as THREE.MeshStandardMaterial;
+    const host = new THREE.MeshStandardMaterial();
+    applyLampLens(host, 'modern');
+    forgedMaterial.onBeforeCompile = host.onBeforeCompile;
+    forgedMaterial.customProgramCacheKey = host.customProgramCacheKey;
+    const transparent = makeBox(3);
+    applyLampLens(transparent.material as THREE.MeshStandardMaterial, 'victorian');
+    (transparent.material as THREE.Material).transparent = true;
+    root.add(forged, transparent);
+    expect(collectStaticBatchCandidates(root)).toHaveLength(0);
+  });
+
+  it('ignores R3F ownership graphs when comparing identical rendered materials', () => {
+    const root = new THREE.Group();
+    const left = makeBox(-2);
+    const right = makeBox(3);
+    for (const [index, mesh] of [left, right].entries()) {
+      // R3F attaches this enumerable metadata to mounted materials. Its parent
+      // and children describe the React scene, not the material's appearance.
+      Object.assign(mesh.material, {
+        __r3f: { type: 'meshStandardMaterial', parent: { key: index }, children: [] },
+      });
+    }
+    root.add(left, right);
+    const candidates = collectStaticBatchCandidates(root);
+    expect(candidates[0]?.materialSignature).toBe(candidates[1]?.materialSignature);
+    expect(candidates[0]?.materialSignature).not.toContain('__r3f');
+    expect(createStaticMeshBatches(root, candidates, 'mounted', 2)).toHaveLength(1);
+  });
+
+  it('never traverses a mounted material ownership graph', () => {
+    const root = new THREE.Group();
+    const mesh = makeBox(0);
+    Object.assign(mesh.material, {
+      __r3f: {
+        get parent() {
+          throw new Error('Material signing traversed the R3F scene graph');
+        },
+      },
+    });
+    root.add(mesh);
+    expect(() => collectStaticBatchCandidates(root)).not.toThrow();
+  });
+
+  it('instances transform-stable opaque duplicates without changing their world transforms', () => {
+    const root = new THREE.Group();
+    const left = makeBox(-2);
+    const right = makeBox(3);
+    root.add(left, right);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'test', 2);
+
+    expect(batches).toHaveLength(1);
+    const batchMesh = batches[0]?.mesh;
+    expect(batchMesh).toBeInstanceOf(THREE.InstancedMesh);
+    if (!(batchMesh instanceof THREE.InstancedMesh)) {
+      throw new Error('Expected transform-compatible duplicates to produce an InstancedMesh');
+    }
+    expect(batchMesh.count).toBe(2);
+    expect(left.parent).toBeNull();
+    expect(right.parent).toBeNull();
+
+    const matrix = new THREE.Matrix4();
+    batchMesh.getMatrixAt(0, matrix);
+    expect(new THREE.Vector3().setFromMatrixPosition(matrix).x).toBeCloseTo(-2);
+    batchMesh.getMatrixAt(1, matrix);
+    expect(new THREE.Vector3().setFromMatrixPosition(matrix).x).toBeCloseTo(3);
+  });
+
+  it.each(['merged', 'instanced'] as const)(
+    'keeps %s outputs fixed locally while following a moving parent',
+    (kind) => {
+      const parent = new THREE.Group();
+      const root = new THREE.Group();
+      parent.add(root);
+      root.position.set(4, 2, -3);
+      const left = makeBox(2);
+      const right = makeBox(7);
+      if (kind === 'merged') right.geometry = new THREE.CylinderGeometry(0.5, 0.5, 2, 8);
+      left.castShadow = right.castShadow = true;
+      left.receiveShadow = right.receiveShadow = true;
+      root.add(left, right);
+      const candidates = collectStaticBatchCandidates(root);
+      const batches = createStaticMeshBatches(root, candidates, 'fixed-local', 2);
+      expect(batches).toHaveLength(1);
+      const output = batches[0].mesh;
+      expect(output instanceof THREE.InstancedMesh).toBe(kind === 'instanced');
+      expect(output.matrixAutoUpdate).toBe(false);
+      expect(output.matrixWorldAutoUpdate).toBe(true);
+      expect(output.matrix.equals(new THREE.Matrix4())).toBe(true);
+      expect(output.castShadow).toBe(true);
+      expect(output.receiveShadow).toBe(true);
+      const localBounds = new THREE.Box3()
+        .setFromObject(output)
+        .applyMatrix4(root.matrixWorld.clone().invert());
+      const updateLocal = vi.spyOn(output, 'updateMatrix');
+
+      parent.position.set(10, 4, -7);
+      parent.rotation.y = Math.PI / 2;
+      root.updateWorldMatrix(true, true);
+      expect(output.matrixWorld.equals(root.matrixWorld)).toBe(true);
+      const expectedBounds = localBounds.clone().applyMatrix4(root.matrixWorld);
+      const actualBounds = new THREE.Box3().setFromObject(output);
+      expect(actualBounds.min.distanceTo(expectedBounds.min)).toBeLessThan(1e-6);
+      expect(actualBounds.max.distanceTo(expectedBounds.max)).toBeLessThan(1e-6);
+      expect(updateLocal).not.toHaveBeenCalled();
+      expect(left.matrixAutoUpdate).toBe(true);
+      expect(right.matrixAutoUpdate).toBe(true);
+      updateLocal.mockRestore();
+    }
+  );
+
+  it('keeps interactive and explicitly dynamic meshes out of static batching', () => {
+    const root = new THREE.Group();
+    const transparent = makeBox(0);
+    (transparent.material as THREE.MeshStandardMaterial).transparent = true;
+    const interactive = makeBox(1);
+    interactive.userData.noStaticBatch = true;
+    const dynamicParent = new THREE.Group();
+    dynamicParent.userData.dynamic = true;
+    dynamicParent.add(makeBox(2));
+    root.add(transparent, interactive, dynamicParent);
+
+    expect(collectStaticBatchCandidates(root)).toEqual([
+      expect.objectContaining({ mesh: transparent }),
+    ]);
+  });
+
+  it('keeps descendants of hidden groups out of visible root-level batches', () => {
+    const root = new THREE.Group();
+    const hidden = new THREE.Group();
+    hidden.visible = false;
+    hidden.add(makeBox(-1), makeBox(1));
+    root.add(hidden);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'hidden', 2);
+
+    expect(candidates).toHaveLength(0);
+    expect(batches).toHaveLength(0);
+    expect(root.children).toEqual([hidden]);
+  });
+
+  it('rechecks ancestor eligibility before replacing collected meshes', () => {
+    const root = new THREE.Group();
+    const parent = new THREE.Group();
+    const left = makeBox(-1);
+    const right = makeBox(1);
+    parent.add(left, right);
+    root.add(parent);
+
+    const candidates = collectStaticBatchCandidates(root);
+    expect(candidates).toHaveLength(2);
+
+    parent.visible = false;
+    const batches = createStaticMeshBatches(root, candidates, 'newly-hidden', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(parent.children).toEqual([left, right]);
+  });
+
+  it('does not instance geometries with different render attributes', () => {
+    const root = new THREE.Group();
+    const firstGeometry = new THREE.BoxGeometry(1, 1, 1);
+    const secondGeometry = firstGeometry.clone();
+    secondGeometry.getAttribute('uv').setX(0, 0.375);
+    const material = new THREE.MeshStandardMaterial({ color: '#778899' });
+    const first = new THREE.Mesh(firstGeometry, material);
+    const second = new THREE.Mesh(secondGeometry, material.clone());
+    second.position.x = 2;
+    root.add(first, second);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'attributes', 2);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0].mesh).not.toBeInstanceOf(THREE.InstancedMesh);
+    const firstUV = firstGeometry.toNonIndexed();
+    const secondUV = secondGeometry.toNonIndexed();
+    expect(Array.from(batches[0].mesh.geometry.getAttribute('uv').array)).toEqual([
+      ...firstUV.getAttribute('uv').array,
+      ...secondUV.getAttribute('uv').array,
+    ]);
+    firstUV.dispose();
+    secondUV.dispose();
+  });
+
+  it('keeps a pinned surface profile through the batch and out of unpinned groups', () => {
+    // The tank shells are pinned to `vessel`; a merge group's finish comes from
+    // its representative, so a pinned and an unpinned mesh must never share one.
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const shell = () => {
+      const material = new THREE.MeshStandardMaterial({ color: '#f2f4f3', roughness: 0.4 });
+      return applyWorldSurface(pinSurfaceProfile(material, 'vessel'), 'vessel');
+    };
+    const mixed = new THREE.Group();
+    const pinned = new THREE.Mesh(geometry, shell());
+    const plain = new THREE.Mesh(
+      geometry,
+      new THREE.MeshStandardMaterial({ color: '#f2f4f3', roughness: 0.4 })
+    );
+    plain.position.x = 2;
+    mixed.add(pinned, plain);
+    expect(
+      createStaticMeshBatches(
+        mixed,
+        collectStaticBatchCandidates(mixed),
+        'pin-mixed',
+        2,
+        applyBatchWorldSurface
+      )
+    ).toHaveLength(0);
+
+    const tanks = new THREE.Group();
+    for (let index = 0; index < 3; index += 1) {
+      const mesh = new THREE.Mesh(geometry, shell());
+      mesh.position.x = index * 2;
+      tanks.add(mesh);
+    }
+    const batches = createStaticMeshBatches(
+      tanks,
+      collectStaticBatchCandidates(tanks),
+      'pin-tanks',
+      2,
+      applyBatchWorldSurface
+    );
+    expect(batches).toHaveLength(1);
+    const output = batches[0].mesh.material as THREE.MeshStandardMaterial;
+    expect(hasWorldSurface(output)).toBe(true);
+    expect(output.userData.millosWorldSurfaceProfile).toBe('vessel');
+  });
+
+  it('does not instance materials with different rendered properties', () => {
+    const root = new THREE.Group();
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const aoMap = new THREE.Texture();
+    const dim = new THREE.MeshStandardMaterial({ color: '#778899', aoMap, aoMapIntensity: 0 });
+    const strong = new THREE.MeshStandardMaterial({
+      color: '#778899',
+      aoMap,
+      aoMapIntensity: 1,
+    });
+    const first = new THREE.Mesh(geometry, dim);
+    const second = new THREE.Mesh(geometry, strong);
+    second.position.x = 2;
+    root.add(first, second);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'material-properties', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(first.parent).toBe(root);
+    expect(second.parent).toBe(root);
+  });
+
+  it.each([
+    {
+      property: 'channel',
+      configure: (texture: THREE.Texture) => {
+        texture.channel = 1;
+      },
+    },
+    {
+      property: 'minFilter',
+      configure: (texture: THREE.Texture) => {
+        texture.minFilter = THREE.NearestFilter;
+      },
+    },
+  ])('does not instance textures with different $property settings', ({ configure }) => {
+    const root = new THREE.Group();
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const firstMap = new THREE.Texture({ width: 1, height: 1 });
+    const secondMap = firstMap.clone();
+    configure(secondMap);
+    const first = new THREE.Mesh(
+      geometry,
+      new THREE.MeshStandardMaterial({ color: '#778899', map: firstMap })
+    );
+    const second = new THREE.Mesh(
+      geometry,
+      new THREE.MeshStandardMaterial({ color: '#778899', map: secondMap })
+    );
+    second.position.x = 2;
+    root.add(first, second);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'texture-settings', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(first.parent).toBe(root);
+    expect(second.parent).toBe(root);
+  });
+
+  it('handles cyclic custom material data conservatively', () => {
+    const root = new THREE.Group();
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const firstDefines: Record<string, unknown> = {};
+    const secondDefines: Record<string, unknown> = {};
+    firstDefines.self = firstDefines;
+    secondDefines.self = secondDefines;
+    const firstMaterial = new THREE.MeshStandardMaterial({ color: '#778899' });
+    const secondMaterial = firstMaterial.clone();
+    firstMaterial.defines = firstDefines as Record<string, string>;
+    secondMaterial.defines = secondDefines as Record<string, string>;
+    const first = new THREE.Mesh(geometry, firstMaterial);
+    const second = new THREE.Mesh(geometry, secondMaterial);
+    second.position.x = 2;
+    root.add(first, second);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'cyclic-material', 2);
+
+    expect(candidates).toHaveLength(2);
+    expect(batches).toHaveLength(0);
+    expect(root.children).toEqual([first, second]);
+  });
+
+  it('partitions coarse geometry collisions without repeatedly rescanning every buffer', () => {
+    const root = new THREE.Group();
+    const material = new THREE.MeshStandardMaterial({
+      color: '#778899',
+      transparent: true,
+      opacity: 0.5,
+    });
+    const geometryCount = 24;
+    let arrayReads = 0;
+
+    for (let geometryIndex = 0; geometryIndex < geometryCount; geometryIndex += 1) {
+      const values = new Float32Array(48 * 3);
+      values.set([-1, -1, -1, 1, 1, 1]);
+      values[24 * 3] = geometryIndex / geometryCount;
+      const position = new THREE.BufferAttribute(values, 3);
+      Object.defineProperty(position, 'array', {
+        configurable: true,
+        get: () => {
+          arrayReads += 1;
+          return values;
+        },
+      });
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', position);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.x = geometryIndex * 2;
+      root.add(mesh);
+    }
+
+    const candidates = collectStaticBatchCandidates(root);
+    arrayReads = 0;
+    const batches = createStaticMeshBatches(root, candidates, 'geometry-collisions', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(root.children).toHaveLength(geometryCount);
+    expect(arrayReads).toBeLessThan(geometryCount * 10);
+  });
+
+  it('instances exact transparent duplicates without merging their draw order', () => {
+    const root = new THREE.Group();
+    const left = makeBox(-1);
+    const right = makeBox(1);
+    for (const mesh of [left, right]) {
+      const material = mesh.material as THREE.MeshStandardMaterial;
+      material.transparent = true;
+      material.opacity = 0.45;
+      material.depthWrite = false;
+    }
+    root.add(left, right);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'transparent', 2);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.mesh).toBeInstanceOf(THREE.InstancedMesh);
+    expect((batches[0]?.mesh.material as THREE.Material).transparent).toBe(true);
+  });
+
+  it('rejects candidates whose transforms change during the sample window', () => {
+    const root = new THREE.Group();
+    const left = makeBox(-1);
+    const right = makeBox(1);
+    root.add(left, right);
+    const candidates = collectStaticBatchCandidates(root);
+
+    right.position.x = 4;
+    right.updateMatrixWorld(true);
+    const batches = createStaticMeshBatches(root, candidates, 'test', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(left.visible).toBe(true);
+    expect(right.visible).toBe(true);
+  });
+
+  it('merges different rigid geometries at startup only with exact compatible materials', () => {
+    const root = new THREE.Group();
+    const materialA = new THREE.MeshStandardMaterial({ color: '#445566', roughness: 0.8 });
+    const materialB = new THREE.MeshStandardMaterial({ color: '#445566', roughness: 0.8 });
+    const box = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), materialA);
+    const cylinder = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 2, 8), materialB);
+    cylinder.position.x = 3;
+    root.add(box, cylinder);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'test', 2);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0].mesh).not.toBeInstanceOf(THREE.InstancedMesh);
+    expect(batches[0].originals).toHaveLength(2);
+    expect(batches[0].mesh.geometry.getAttribute('position').count).toBe(
+      box.geometry.index!.count + cylinder.geometry.index!.count
+    );
+  });
+
+  it('does not merge colour variants across spatial-cell boundaries', () => {
+    const root = new THREE.Group();
+    const red = makeBox(-2, '#ff0000');
+    const blue = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.5, 0.5, 2, 8),
+      new THREE.MeshStandardMaterial({ color: '#0000ff', roughness: 0.7 })
+    );
+    blue.position.x = 2;
+    root.add(red, blue);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'test', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(red.parent).toBe(root);
+    expect(blue.parent).toBe(root);
+  });
+
+  it('preserves opaque colour variants with per-instance colours', () => {
+    const root = new THREE.Group();
+    const red = makeBox(-2, '#ff0000');
+    const blue = makeBox(2, '#0000ff');
+    root.add(red, blue);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'colour', 2);
+
+    expect(batches).toHaveLength(1);
+    const instance = batches[0]?.mesh as THREE.InstancedMesh;
+    expect(instance.count).toBe(2);
+    const color = new THREE.Color();
+    instance.getColorAt(0, color);
+    expect(color.getHexString()).toBe('ff0000');
+    instance.getColorAt(1, color);
+    expect(color.getHexString()).toBe('0000ff');
+    expect((instance.material as THREE.MeshStandardMaterial).color.getHexString()).toBe('ffffff');
+
+    // NOT `vertexColors`. This assertion used to require `true`, which is how a
+    // green suite shipped 122 meshes that rendered with zero diffuse - three
+    // shops, two cottages, the whole truck yard, the dock openings and every
+    // machine status beacon.
+    //
+    // `instanceColor` does not need it: three defines `USE_INSTANCING_COLOR`
+    // from `object.instanceColor !== null`, and that alone declares `vColor`,
+    // initialises it to 1.0 and multiplies by the instance tint, while the
+    // fragment side defines `USE_COLOR` from `vertexColors || instancingColor`
+    // so the tint still reaches `diffuseColor`. Setting `vertexColors` ALSO
+    // defines `USE_COLOR` in the vertex shader, which inserts `vColor *= color`
+    // against a `color` attribute these geometries do not have - and an unbound
+    // attribute reads as the WebGL generic default `(0, 0, 0, 1)`.
+    //
+    // Asserted against the geometry rather than hardcoded false, so a source
+    // material that genuinely paints from vertex colours still passes.
+    const batchMaterial = instance.material as THREE.MeshStandardMaterial;
+    expect(batchMaterial.vertexColors).toBe(Boolean(instance.geometry.getAttribute('color')));
+    expect(instance.instanceColor).not.toBeNull();
+  });
+
+  it('never leaves a batch material reading a vertex colour its geometry lacks', () => {
+    // The general form of the defect above, over every batch this module can
+    // produce - merged and instanced alike. `createMergedGeometry` writes a
+    // `color` attribute into everything it builds, so the merge path may
+    // legitimately set `vertexColors`; the instanced path reuses the
+    // representative's geometry untouched and may not.
+    const root = new THREE.Group();
+    for (let i = 0; i < 6; i += 1) {
+      root.add(makeBox(i * 2 - 6, i % 2 === 0 ? '#ff0000' : '#0000ff'));
+    }
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'guard', 2);
+
+    expect(batches.length).toBeGreaterThan(0);
+    for (const batch of batches) {
+      const material = batch.mesh.material as THREE.MeshStandardMaterial;
+      if (!material.vertexColors) continue;
+      expect(batch.mesh.geometry.getAttribute('color')).toBeDefined();
+    }
+  });
+
+  it('keeps transparent colour variants in separate draw-order groups', () => {
+    const root = new THREE.Group();
+    const red = makeBox(-2, '#ff0000');
+    const blue = makeBox(2, '#0000ff');
+    for (const mesh of [red, blue]) {
+      const material = mesh.material as THREE.MeshStandardMaterial;
+      material.transparent = true;
+      material.opacity = 0.5;
+      material.depthWrite = false;
+    }
+    root.add(red, blue);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'transparent-colour', 2);
+
+    expect(batches).toHaveLength(0);
+    expect(red.parent).toBe(root);
+    expect(blue.parent).toBe(root);
+  });
+
+  it('merges stable opaque singletons by material and spatial cell', () => {
+    const root = new THREE.Group();
+    const meshes = [
+      new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshStandardMaterial({ color: '#d97706', roughness: 0.7 })
+      ),
+      new THREE.Mesh(
+        new THREE.CylinderGeometry(0.5, 0.5, 2, 8),
+        new THREE.MeshStandardMaterial({ color: '#2563eb', roughness: 0.7 })
+      ),
+      new THREE.Mesh(
+        new THREE.SphereGeometry(0.65, 8, 6),
+        new THREE.MeshStandardMaterial({ color: '#16a34a', roughness: 0.7 })
+      ),
+      new THREE.Mesh(
+        new THREE.ConeGeometry(0.6, 1.5, 8),
+        new THREE.MeshStandardMaterial({ color: '#dc2626', roughness: 0.7 })
+      ),
+    ];
+    meshes.forEach((mesh, index) => {
+      mesh.position.x = index * 2;
+      root.add(mesh);
+    });
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'merge', 2);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.mesh).not.toBeInstanceOf(THREE.InstancedMesh);
+    expect(batches[0]?.originals).toHaveLength(4);
+    expect(batches[0]?.mesh.geometry.getAttribute('color')).toBeDefined();
+    expect(root.userData.staticBatchStats).toMatchObject({
+      mergedOriginals: 4,
+      mergedMeshes: 1,
+    });
+  });
+
+  it('merges a nearby rigid pair with exactly compatible materials and retains its triangles', () => {
+    const root = new THREE.Group();
+    const left = makeBox(2, '#d97706');
+    const right = new THREE.Mesh(
+      new THREE.SphereGeometry(0.65, 8, 6),
+      new THREE.MeshStandardMaterial({ color: '#2563eb', roughness: 0.7 })
+    );
+    right.position.x = 5;
+    root.add(left, right);
+    root.updateWorldMatrix(true, true);
+    const before = [left, right].flatMap((mesh) => {
+      const geometry = mesh.geometry.toNonIndexed();
+      geometry.applyMatrix4(mesh.matrixWorld);
+      const positions = Array.from(geometry.getAttribute('position').array);
+      geometry.dispose();
+      return positions;
+    });
+    const batches = createStaticMeshBatches(root, collectStaticBatchCandidates(root), 'pair', 2);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.originals).toHaveLength(2);
+    const geometry = batches[0].mesh.geometry;
+    expect(Array.from(geometry.getAttribute('position').array)).toEqual(before);
+    expect(batches[0].mesh.userData.staticBatchSmallRanges).toEqual([
+      { start: 0, count: left.geometry.index!.count },
+      { start: left.geometry.index!.count, count: right.geometry.index!.count },
+    ]);
+    const colors = geometry.getAttribute('color');
+    expect(colors.count).toBe(before.length / 3);
+    expect(colors.getX(0)).toBeCloseTo(new THREE.Color('#d97706').r);
+    expect(colors.getZ(colors.count - 1)).toBeCloseTo(new THREE.Color('#2563eb').b);
+  });
+
+  it('keeps small pairs separate when quantized material properties only approximately match', () => {
+    const root = new THREE.Group();
+    const left = makeBox(2);
+    const right = new THREE.Mesh(
+      new THREE.SphereGeometry(0.65, 8, 6),
+      new THREE.MeshStandardMaterial({ color: '#2563eb', roughness: 0.74 })
+    );
+    right.position.x = 5;
+    root.add(left, right);
+    expect(
+      createStaticMeshBatches(root, collectStaticBatchCandidates(root), 'pair', 2)
+    ).toHaveLength(0);
+    expect(left.parent).toBe(root);
+    expect(right.parent).toBe(root);
+  });
+
+  it('accumulates diagnostics when candidates are processed in startup slices', () => {
+    const root = new THREE.Group();
+    const firstPair = [makeBox(-4), makeBox(-2)];
+    const secondPair = [makeBox(2), makeBox(4)];
+    root.add(...firstPair, ...secondPair);
+
+    const candidates = collectStaticBatchCandidates(root);
+    createStaticMeshBatches(root, candidates.slice(0, 2), 'slice:0', 2);
+    createStaticMeshBatches(root, candidates.slice(2), 'slice:1', 2);
+
+    expect(root.userData.staticBatchStats).toMatchObject({
+      optimizedOriginals: 4,
+      batches: 2,
+      instancedOriginals: 4,
+      instancedBatches: 2,
+    });
+  });
+
+  it('orders lazy traversal results by batching affinity before startup slicing', () => {
+    const root = new THREE.Group();
+    const standardLeft = makeBox(1);
+    const basicLeft = new THREE.Mesh(
+      new THREE.BoxGeometry(1, 2, 3),
+      new THREE.MeshBasicMaterial({ color: '#778899' })
+    );
+    basicLeft.position.x = 2;
+    const standardRight = makeBox(3);
+    const basicRight = new THREE.Mesh(
+      new THREE.BoxGeometry(1, 2, 3),
+      new THREE.MeshBasicMaterial({ color: '#778899' })
+    );
+    basicRight.position.x = 4;
+    root.add(standardLeft, basicLeft, standardRight, basicRight);
+
+    const candidates = collectStaticBatchCandidates(root);
+    const ordered = orderStaticBatchCandidatesForChunking(root, candidates);
+    const materialTypes = ordered.map(({ mesh }) => (mesh.material as THREE.Material).type);
+
+    expect(materialTypes[0]).toBe(materialTypes[1]);
+    expect(materialTypes[2]).toBe(materialTypes[3]);
+    expect(new Set(materialTypes)).toEqual(new Set(['MeshBasicMaterial', 'MeshStandardMaterial']));
+  });
+});
+
+describe('StaticMeshBatch surface callback', () => {
+  /**
+   * The finish has to reach the OUTPUT material, never the source. Assigning an
+   * `onBeforeCompile` to a source material is what `isSupportedMaterial`
+   * rejects, so doing it there would evict the mesh from batching for good -
+   * a silent draw-call regression that would surface passes later.
+   */
+  it('treats the merged output and leaves the sources untouched', () => {
+    const root = new THREE.Group();
+    // Four distinct geometries so they merge rather than instance, all sharing
+    // one merge-compatible material description.
+    const sources: THREE.Mesh[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(1 + index * 0.5, 2, 3),
+        new THREE.MeshStandardMaterial({ color: '#8899aa', roughness: 0.9 })
+      );
+      mesh.position.set(index * 2, 0, 0);
+      sources.push(mesh);
+      root.add(mesh);
+    }
+
+    const candidates = collectStaticBatchCandidates(root);
+    const batches = createStaticMeshBatches(root, candidates, 'test', 2, applyBatchWorldSurface);
+
+    expect(batches.length).toBeGreaterThan(0);
+    for (const batch of batches) {
+      const material = batch.mesh.material as THREE.Material;
+      expect(hasWorldSurface(material)).toBe(true);
+    }
+    for (const source of sources) {
+      expect(hasWorldSurface(source.material as THREE.Material)).toBe(false);
+    }
+    const stats = root.userData.staticBatchStats as { surfaceProfiles: Record<string, number> };
+    expect(stats.surfaceProfiles.masonry).toBeGreaterThan(0);
+  });
+
+  /**
+   * A candidate the batcher declined to optimise must still be finished, and
+   * finishing it must not disqualify it next time. `isSupportedMaterial` exempts
+   * this module's own injection precisely so the second collection still sees it.
+   */
+  it('finishes leftovers, and a finished leftover is still a candidate', () => {
+    const root = new THREE.Group();
+    const lonely = new THREE.Mesh(
+      new THREE.BoxGeometry(4, 1, 1),
+      new THREE.MeshStandardMaterial({ color: '#445566', roughness: 0.4 })
+    );
+    root.add(lonely);
+
+    const first = collectStaticBatchCandidates(root);
+    expect(first).toHaveLength(1);
+    const batches = createStaticMeshBatches(root, first, 'test', 2, applyBatchWorldSurface);
+    expect(batches).toHaveLength(0);
+    expect(hasWorldSurface(lonely.material as THREE.Material)).toBe(true);
+
+    const second = collectStaticBatchCandidates(root);
+    expect(second).toHaveLength(1);
+  });
+
+  /**
+   * THE DECLINED SWEEP IS OPT-IN, and this is the test that made it so.
+   *
+   * `collectStaticBatchCandidates` finishes the materials of meshes it will
+   * never batch - `InstancedMesh`, and anything under a dynamic ancestor - which
+   * is the only pass that reaches the several hundred inline JSX materials in
+   * `FactoryExterior` and `TruckBay`. But mounting `StaticMeshBatch` WITHOUT a
+   * `surface` prop says "batch this, do not restyle it", and the first cut of
+   * the sweep overruled that silently. It also kept its tally on the module, so
+   * the counts accumulated across every root and every re-run and described no
+   * tree in particular. Both were caught here rather than by reading.
+   */
+  it('sweeps declined meshes only when the caller asked for a finish', () => {
+    const build = () => {
+      const root = new THREE.Group();
+      const instanced = new THREE.InstancedMesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshStandardMaterial({ color: '#8d8d88', roughness: 0.95 }),
+        3
+      );
+      root.add(instanced);
+      return { root, instanced };
+    };
+
+    const off = build();
+    collectStaticBatchCandidates(off.root);
+    expect(hasWorldSurface(off.instanced.material as THREE.Material)).toBe(false);
+    expect(off.root.userData.staticBatchStats.surfaceProfiles).toEqual({});
+
+    const on = build();
+    collectStaticBatchCandidates(on.root, true);
+    expect(hasWorldSurface(on.instanced.material as THREE.Material)).toBe(true);
+    expect(on.root.userData.staticBatchStats.surfaceProfiles).toEqual({ 'declined:masonry': 1 });
+
+    // Per-collection, not per-module: a second root reports its own count.
+    const second = build();
+    collectStaticBatchCandidates(second.root, true);
+    expect(second.root.userData.staticBatchStats.surfaceProfiles).toEqual({
+      'declined:masonry': 1,
+    });
+  });
+
+  it('leaves the surface callback optional, and reports nothing when absent', () => {
+    const root = new THREE.Group();
+    root.add(makeBox(-2), makeBox(3));
+    const candidates = collectStaticBatchCandidates(root);
+    createStaticMeshBatches(root, candidates, 'test', 2);
+    const stats = root.userData.staticBatchStats as { surfaceProfiles: Record<string, number> };
+    expect(stats.surfaceProfiles).toEqual({});
+  });
+});
+
+it('carries the actual owned yard and apron wetness into their compiled batch shaders', () => {
+  const root = new THREE.Group();
+  const geometry = new THREE.BoxGeometry(1, 0.1, 1);
+  for (const [i, props] of [
+    YARD_TARMAC_SURFACE,
+    APRON_CONCRETE_SURFACE,
+    ROAD_TARMAC_SURFACE,
+  ].entries()) {
+    const material = new THREE.MeshStandardMaterial(props);
+    const first = new THREE.Mesh(geometry, material);
+    first.position.x = i * 3;
+    root.add(first);
+    const other = new THREE.Mesh(geometry, material.clone());
+    other.position.x = i * 3;
+    other.position.z = 3;
+    root.add(other);
+  }
+  const batches = createStaticMeshBatches(
+    root,
+    collectStaticBatchCandidates(root, true),
+    'yard-weather',
+    2,
+    applyBatchWorldSurface
+  );
+  expect(batches).toHaveLength(3);
+  for (const batch of batches) {
+    const material = batch.mesh.material as THREE.MeshStandardMaterial;
+    const shader = {
+      uniforms: {},
+      vertexShader: THREE.ShaderLib.standard.vertexShader,
+      fragmentShader: THREE.ShaderLib.standard.fragmentShader,
+    } as THREE.WebGLProgramParametersWithUniforms;
+    material.onBeforeCompile(shader, {} as THREE.WebGLRenderer);
+    if (material.map !== ROAD_TARMAC_SURFACE.map) {
+      expect(shader.uniforms.uSurfWeatherWetness).toBe(SURFACE_WETNESS);
+      expect(shader.fragmentShader).toContain('surfWetGround( diffuseColor.rgb, roughnessFactor )');
+    } else expect(shader.uniforms.uSurfWeatherWetness.value).toBe(0);
+  }
+});
+
+it('preserves explicit wet/dry partitions through clone repair, finishing and rebatching with identical texture source', () => {
+  const geometry = new THREE.BoxGeometry(1, 0.1, 1),
+    map = YARD_TARMAC_SURFACE.map;
+  const root = new THREE.Group();
+  for (const [index, profile] of ['exteriorSlab', 'slab'].entries()) {
+    const material = pinSurfaceProfile(
+      new THREE.MeshStandardMaterial({ map, roughness: 1 }),
+      profile as 'exteriorSlab' | 'slab'
+    );
+    applyDeclinedWorldSurface(material);
+    const ghost = material.clone();
+    expect(hasWorldSurface(ghost)).toBe(false);
+    expect(pinnedSurfaceProfile(ghost)).toBe(profile);
+    applyDeclinedWorldSurface(ghost);
+    expect(hasWorldSurface(ghost)).toBe(true);
+    for (let i = 0; i < 2; i++) {
+      const mesh = new THREE.Mesh(geometry, i ? ghost : material);
+      mesh.position.set(index * 3, 0, i * 3);
+      root.add(mesh);
+    }
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    const batches = createStaticMeshBatches(
+      root,
+      collectStaticBatchCandidates(root, true),
+      'wet-partition-' + pass,
+      2,
+      applyBatchWorldSurface
+    );
+    expect(batches).toHaveLength(2);
+    const next = new THREE.Group();
+    for (const batch of batches) {
+      const material = batch.mesh.material as THREE.MeshStandardMaterial;
+      const shader = {
+        uniforms: {},
+        vertexShader: THREE.ShaderLib.standard.vertexShader,
+        fragmentShader: THREE.ShaderLib.standard.fragmentShader,
+      } as THREE.WebGLProgramParametersWithUniforms;
+      material.onBeforeCompile(shader, {} as THREE.WebGLRenderer);
+      expect(shader.uniforms.uSurfWeatherWetness === SURFACE_WETNESS).toBe(
+        pinnedSurfaceProfile(material) === 'exteriorSlab'
+      );
+      // Reconstitute ordinary source meshes from the actual batch output material.
+      for (let i = 0; i < 2; i++) {
+        const clone = material.clone();
+        applyDeclinedWorldSurface(clone);
+        const mesh = new THREE.Mesh(geometry, clone);
+        mesh.position.x = i * 2;
+        next.add(mesh);
+      }
+    }
+    if (pass === 0) {
+      root.clear();
+      root.add(...[...next.children]);
+    }
+  }
+});

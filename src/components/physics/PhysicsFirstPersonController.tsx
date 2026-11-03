@@ -1,0 +1,383 @@
+/**
+ * Physics-based first-person controller
+ *
+ * Uses Rapier rigid body for player movement and collision.
+ * Camera follows the physics body position.
+ */
+
+import React, { useRef, useEffect, useCallback, useMemo } from 'react';
+import { useThree, useFrame } from '@react-three/fiber';
+import { PointerLockControls } from '@react-three/drei';
+import { RigidBody, CapsuleCollider } from '@react-three/rapier';
+import type { RapierRigidBody } from '@react-three/rapier';
+import * as THREE from 'three';
+import { clampShelterVerticalMovement } from '../../constants/publicRealmLayout';
+import { useUIStore } from '../../stores/uiStore';
+import { useGraphicsStore } from '../../stores/graphicsStore';
+import {
+  sampleWalkingGroundHeight,
+  isWithinWalkingDomain,
+  clampWalkingSpawn,
+  walkingBlocks,
+  isDryWalkingGround,
+  moveWalkingPosition,
+} from '../../utils/castleNavigation';
+import { getTerrainGridSegments } from '../terrain/terrainTypes';
+import {
+  PHYSICS_CONFIG,
+  COLLISION_FILTERS,
+  createCollisionGroups,
+} from '../../physics/PhysicsConfig';
+import {
+  clampNavigationDelta,
+  getNavigationIntent,
+  shouldHandleNavigationKey,
+  shouldPreventNavigationDefault,
+} from '../../utils/cameraNavigation';
+
+// Movement configuration
+const FPS_FOV = 105;
+const ORBIT_FOV = 65;
+const MOUSE_SENSITIVITY = 1.5;
+const PLAYER_RADIUS = PHYSICS_CONFIG.player.capsuleRadius;
+const VERTICAL_SPEED = 8;
+const MIN_BODY_HEIGHT = 0.02;
+const INSPECTION_BODY_HEIGHT =
+  2 * (PHYSICS_CONFIG.player.capsuleHalfHeight + PLAYER_RADIUS) + MIN_BODY_HEIGHT;
+const MAX_CAMERA_HEIGHT = 60;
+const PHYSICS_SPRINT_MULTIPLIER =
+  PHYSICS_CONFIG.player.maxSprintVelocity / PHYSICS_CONFIG.player.maxLinearVelocity;
+
+// Track pressed keys (module level to persist across renders)
+const pressedKeys = new Set<string>();
+
+interface PhysicsFirstPersonControllerProps {
+  onLockChange?: (locked: boolean) => void;
+}
+
+// Helper to clamp velocity magnitude
+function clampVelocity(rb: RapierRigidBody, maxSpeed: number): void {
+  const vel = rb.linvel();
+  const speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+  if (speed > maxSpeed) {
+    const scale = maxSpeed / speed;
+    rb.setLinvel({ x: vel.x * scale, y: vel.y, z: vel.z * scale }, true);
+  }
+}
+
+export const PhysicsFirstPersonController: React.FC<PhysicsFirstPersonControllerProps> = ({
+  onLockChange,
+}) => {
+  const { camera, gl } = useThree();
+  const controlsRef = useRef<typeof PointerLockControls.prototype>(null);
+  const rigidBodyRef = useRef<RapierRigidBody>(null);
+  const isLocked = useRef(false);
+
+  // Reusable vectors for calculations
+  const directionRef = useRef(new THREE.Vector3());
+  const forwardRef = useRef(new THREE.Vector3());
+  const rightRef = useRef(new THREE.Vector3());
+  const moveVecRef = useRef(new THREE.Vector3());
+
+  // Collision groups
+  const collisionGroups = useMemo(
+    () =>
+      createCollisionGroups(COLLISION_FILTERS.player.memberships, COLLISION_FILTERS.player.filter),
+    []
+  );
+
+  // Calculate spawn position from current camera position (captured at mount)
+  const spawnPosition = useMemo((): [number, number, number] => {
+    const currentX = camera.position.x;
+    const currentZ = camera.position.z;
+    let [spawnX, spawnZ] = clampWalkingSpawn(currentX, currentZ, PLAYER_RADIUS);
+
+    const segments = getTerrainGridSegments(useGraphicsStore.getState().graphics.quality);
+    if (
+      !isDryWalkingGround(spawnX, spawnZ, segments) ||
+      walkingBlocks(spawnX, spawnZ, sampleWalkingGroundHeight(spawnX, spawnZ, segments))
+    ) {
+      search: for (let radius = 1; radius <= 64; radius++) {
+        for (let i = 0; i < 16; i++) {
+          const x = spawnX + radius * Math.cos((i * Math.PI) / 8);
+          const z = spawnZ + radius * Math.sin((i * Math.PI) / 8);
+          if (
+            isWithinWalkingDomain(x, z, PLAYER_RADIUS) &&
+            isDryWalkingGround(x, z, segments) &&
+            !walkingBlocks(x, z, sampleWalkingGroundHeight(x, z, segments))
+          ) {
+            spawnX = x;
+            spawnZ = z;
+            break search;
+          }
+        }
+      }
+    }
+    // The rigid-body datum clears the surface by 2 cm; the eye offset removes
+    // that clearance so every spawn is exactly 1.7 m above its walkable floor.
+    return [
+      spawnX,
+      MIN_BODY_HEIGHT +
+        sampleWalkingGroundHeight(
+          spawnX,
+          spawnZ,
+          getTerrainGridSegments(useGraphicsStore.getState().graphics.quality)
+        ),
+      spawnZ,
+    ];
+  }, []);
+
+  const previousPosition = useRef({
+    x: spawnPosition[0],
+    y: spawnPosition[1],
+    z: spawnPosition[2],
+  });
+
+  const previousSegments = useRef(
+    getTerrainGridSegments(useGraphicsStore.getState().graphics.quality)
+  );
+
+  // Set initial camera FOV and look direction
+  useEffect(() => {
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.fov = FPS_FOV;
+      camera.updateProjectionMatrix();
+    }
+
+    // Set camera to look toward center from spawn position
+    camera.position.set(
+      spawnPosition[0],
+      spawnPosition[1] + PHYSICS_CONFIG.player.height - MIN_BODY_HEIGHT,
+      spawnPosition[2]
+    );
+    camera.lookAt(0, PHYSICS_CONFIG.player.height, 0);
+
+    return () => {
+      if (camera instanceof THREE.PerspectiveCamera) {
+        camera.fov = ORBIT_FOV;
+        camera.updateProjectionMatrix();
+      }
+      if (document.pointerLockElement) {
+        document.exitPointerLock();
+      }
+    };
+  }, [camera, spawnPosition]);
+
+  // Keyboard event handlers
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (shouldHandleNavigationKey(e)) {
+        pressedKeys.add(e.code);
+        if (shouldPreventNavigationDefault(e.code)) e.preventDefault();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      pressedKeys.delete(e.code);
+    };
+
+    const clearPressedKeys = () => pressedKeys.clear();
+    const handleVisibilityChange = () => {
+      if (document.hidden) clearPressedKeys();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', clearPressedKeys);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', clearPressedKeys);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      clearPressedKeys();
+    };
+  }, []);
+
+  // Track frame count for throttled multiplayer updates
+
+  // Movement update
+  useFrame((_state, delta) => {
+    if (!rigidBodyRef.current || !isLocked.current) return;
+
+    const rb = rigidBodyRef.current;
+    const cappedDelta = clampNavigationDelta(delta);
+    const keyboardIntent = getNavigationIntent(pressedKeys);
+
+    // Get movement input
+    const dir = directionRef.current.set(keyboardIntent.strafe, 0, -keyboardIntent.forward);
+
+    // Normalize diagonal movement
+    if (dir.lengthSq() > 0) {
+      dir.normalize();
+    }
+
+    // Calculate world-space movement based on camera direction
+    const forward = forwardRef.current.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    const right = rightRef.current.set(1, 0, 0).applyQuaternion(camera.quaternion);
+
+    // Keep movement horizontal
+    forward.y = 0;
+    right.y = 0;
+    forward.normalize();
+    right.normalize();
+
+    // Calculate movement direction
+    const moveVec = moveVecRef.current.set(0, 0, 0);
+    moveVec.addScaledVector(forward, -dir.z);
+    moveVec.addScaledVector(right, dir.x);
+
+    // Determine force and max speed
+    const isSprinting = keyboardIntent.sprint;
+    const force = isSprinting ? PHYSICS_CONFIG.player.sprintForce : PHYSICS_CONFIG.player.moveForce;
+    const maxSpeed = isSprinting
+      ? PHYSICS_CONFIG.player.maxSprintVelocity
+      : PHYSICS_CONFIG.player.maxLinearVelocity;
+
+    // Apply movement force
+    if (moveVec.lengthSq() > 0) {
+      rb.applyImpulse(
+        {
+          x: moveVec.x * force * cappedDelta,
+          y: 0,
+          z: moveVec.z * force * cappedDelta,
+        },
+        true
+      );
+    }
+
+    // Clamp velocity
+    clampVelocity(rb, maxSpeed);
+
+    // Q/E provide collision-aware vertical inspection movement in the Rapier
+    // path as well as the default controller. With gravity disabled, zero input
+    // deliberately holds the current inspection altitude.
+    const currentPosition = rb.translation();
+    const maxBodyHeight = MAX_CAMERA_HEIGHT - PHYSICS_CONFIG.player.height + MIN_BODY_HEIGHT;
+    const minBodyHeight =
+      MIN_BODY_HEIGHT +
+      sampleWalkingGroundHeight(
+        currentPosition.x,
+        currentPosition.z,
+        getTerrainGridSegments(useGraphicsStore.getState().graphics.quality)
+      );
+    let verticalVelocity =
+      keyboardIntent.vertical * VERTICAL_SPEED * (isSprinting ? PHYSICS_SPRINT_MULTIPLIER : 1);
+    if (
+      (currentPosition.y <= minBodyHeight && verticalVelocity < 0) ||
+      (currentPosition.y >= maxBodyHeight && verticalVelocity > 0)
+    ) {
+      verticalVelocity = 0;
+    }
+    const currentVelocity = rb.linvel();
+    rb.setLinvel({ x: currentVelocity.x, y: verticalVelocity, z: currentVelocity.z }, true);
+
+    if (currentPosition.y < minBodyHeight || currentPosition.y > maxBodyHeight) {
+      rb.setTranslation(
+        {
+          x: currentPosition.x,
+          y: THREE.MathUtils.clamp(currentPosition.y, minBodyHeight, maxBodyHeight),
+          z: currentPosition.z,
+        },
+        true
+      );
+    }
+
+    // Resolve the actual Rapier displacement against the shared stair floors.
+    // Sweep from the previous frame so a fast body cannot skip risers or walls.
+    const incoming = rb.translation();
+    const previous = previousPosition.current;
+    const segments = getTerrainGridSegments(useGraphicsStore.getState().graphics.quality);
+    const oldFloor = sampleWalkingGroundHeight(previous.x, previous.z, previousSegments.current);
+    const grounded =
+      keyboardIntent.vertical === 0 && previous.y <= oldFloor + MIN_BODY_HEIGHT + 0.05;
+    const resolved = {
+      x: previous.x,
+      y: grounded
+        ? sampleWalkingGroundHeight(previous.x, previous.z, segments) + MIN_BODY_HEIGHT
+        : MIN_BODY_HEIGHT +
+          clampShelterVerticalMovement(
+            incoming.x,
+            incoming.z,
+            previous.y - MIN_BODY_HEIGHT,
+            incoming.y - MIN_BODY_HEIGHT,
+            PLAYER_RADIUS,
+            INSPECTION_BODY_HEIGHT
+          ),
+      z: previous.z,
+    };
+    moveWalkingPosition(
+      resolved,
+      incoming.x - previous.x,
+      incoming.z - previous.z,
+      segments,
+      grounded,
+      MIN_BODY_HEIGHT,
+      () => false,
+      INSPECTION_BODY_HEIGHT
+    );
+    if (resolved.y !== incoming.y && !grounded) rb.setLinvel({ ...rb.linvel(), y: 0 }, true);
+    rb.setTranslation(resolved, true);
+    previousPosition.current = { ...rb.translation() };
+    previousSegments.current = segments;
+
+    // Sync camera to physics body position
+    const pos = rb.translation();
+    camera.position.set(pos.x, pos.y + PHYSICS_CONFIG.player.height - MIN_BODY_HEIGHT, pos.z);
+  });
+
+  // Handle lock state changes
+  const handleLock = useCallback(() => {
+    isLocked.current = true;
+    onLockChange?.(true);
+  }, [onLockChange]);
+
+  const handleUnlock = useCallback(() => {
+    isLocked.current = false;
+    pressedKeys.clear();
+    onLockChange?.(false);
+    useUIStore.getState().setFpsMode(false);
+  }, [onLockChange]);
+
+  return (
+    <>
+      {/* Physics body for player collision */}
+      <RigidBody
+        ref={rigidBodyRef}
+        type="dynamic"
+        position={spawnPosition}
+        collisionGroups={collisionGroups}
+        linearDamping={PHYSICS_CONFIG.player.linearDamping}
+        angularDamping={PHYSICS_CONFIG.player.angularDamping}
+        lockRotations
+        enabledRotations={[false, false, false]}
+        userData={{ type: 'player' }}
+        gravityScale={0}
+      >
+        <CapsuleCollider
+          args={[PHYSICS_CONFIG.player.capsuleHalfHeight, PHYSICS_CONFIG.player.capsuleRadius]}
+          position={[
+            0,
+            PHYSICS_CONFIG.player.capsuleHalfHeight + PHYSICS_CONFIG.player.capsuleRadius,
+            0,
+          ]}
+        />
+      </RigidBody>
+
+      {/* Pointer lock controls for mouse look */}
+      <PointerLockControls
+        ref={controlsRef}
+        domElement={gl.domElement}
+        // The instructions own handled native admission. Keep Drei's mouse
+        // and lock listeners, with no automatic document/canvas requests.
+        selector=":not(*)"
+        pointerSpeed={MOUSE_SENSITIVITY}
+        onLock={handleLock}
+        onUnlock={handleUnlock}
+      />
+    </>
+  );
+};
+
+export default PhysicsFirstPersonController;

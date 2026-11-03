@@ -1,0 +1,849 @@
+import { SITE_LAYOUT } from '../constants/siteLayout';
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import { safeJSONStorage } from './storage';
+import { audioManager } from '../utils/audioManager';
+import { useProductionStore } from './productionStore';
+import { useSafetyStore } from './safetyStore';
+import { sanitizeGameSimulationState, sanitizeGameSpeed } from './persistenceMigrations';
+import { migrateLegacyGameSpeed, STANDARD_GAME_SPEED } from '../simulation/pace';
+import { translate } from '../i18n';
+import { gameSimulationStoreMessages } from './gameSimulationStore.messages';
+
+export type CelebrationType = 'milestone' | 'zero_incident' | 'target_met' | 'shift_complete';
+export type CrisisType = 'fire' | 'power_outage' | 'supply_emergency' | 'inspection' | 'weather';
+export type CrisisSeverity = 'low' | 'medium' | 'high' | 'critical';
+export type SafetyEventKind = 'facility_stop' | 'fire_drill' | 'crisis';
+export type SafetyEventStage = 'active' | 'acknowledged' | 'cleared';
+export type RunWindow = 'morning' | 'afternoon' | 'night';
+
+export interface CelebrationEvent {
+  type: CelebrationType;
+  value?: number;
+  timestamp: number;
+  position?: [number, number, number];
+  message?: string;
+}
+
+export interface CrisisState {
+  active: boolean;
+  type: CrisisType | null;
+  severity: CrisisSeverity;
+  startTime: number;
+  affectedMachineId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SafetyEventRecord {
+  id: string;
+  kind: SafetyEventKind;
+  cause: string;
+  severity: CrisisSeverity;
+  simulated: boolean;
+  stage: SafetyEventStage;
+  startedAt: number;
+  response: string;
+  acknowledgedAt?: number;
+  acknowledgementNote?: string;
+  clearedAt?: number;
+  recovery: string;
+}
+
+export interface DrillMetrics {
+  active: boolean;
+  startTime: number;
+  verifiedZoneIds: string[];
+  totalZones: number;
+  verificationComplete: boolean;
+  finalTimeSeconds: number | null;
+}
+
+// `label` is a getter so it reads in the active language whenever it is used.
+export const SERVICE_EGRESS_POINTS = [
+  {
+    id: 'front',
+    position: { x: 0, z: 52 },
+    get label() {
+      return translate(gameSimulationStoreMessages, 'egressFront');
+    },
+  },
+  {
+    id: 'back',
+    position: { x: 0, z: -52 },
+    get label() {
+      return translate(gameSimulationStoreMessages, 'egressBack');
+    },
+  },
+  {
+    id: 'west',
+    position: {
+      x: SITE_LAYOUT.portals.westService.centre[0] - 2,
+      z: SITE_LAYOUT.portals.westService.centre[2],
+    },
+    get label() {
+      return translate(gameSimulationStoreMessages, 'egressWest');
+    },
+  },
+  {
+    id: 'east',
+    position: {
+      x: SITE_LAYOUT.portals.eastService.centre[0] + 2,
+      z: SITE_LAYOUT.portals.eastService.centre[2],
+    },
+    get label() {
+      return translate(gameSimulationStoreMessages, 'egressEast');
+    },
+  },
+] as const;
+
+/**
+ * Who is holding the shift clock at 0. 'player' is an explicit pause choice;
+ * every other holder pauses for its own reason and releases only its own hold.
+ */
+export type ClockHolder =
+  | 'player'
+  | 'shortcut'
+  | 'tour'
+  | 'restore'
+  | 'restoreFailed'
+  | 'workplace'
+  | 'handoff'
+  | 'layout'
+  | 'scada';
+
+/**
+ * Holds derived from game state rather than from a control: the state that
+ * creates them also ends them, so a pace choice cannot. A positive pace made
+ * under one becomes the pace it resumes at instead of starting the clock.
+ * Working if choosing a pace during a handoff decision leaves the clock held
+ * and the plant resumes at that pace once the decision ends.
+ */
+const DERIVED_HOLDERS: readonly ClockHolder[] = ['handoff'];
+
+export interface ClockHold {
+  readonly holder: ClockHolder;
+  /** The pace to return to when this hold is released; 0 stays paused. */
+  readonly resumeSpeed: number;
+}
+
+export interface GameSimulationStore {
+  isTabVisible: boolean;
+  setTabVisible: (visible: boolean) => void;
+
+  gameTime: number;
+  gameDay: number;
+  gameSpeed: number;
+  setGameTime: (time: number) => void;
+  /**
+   * An explicit pace choice: a positive pace clears every hold except a derived
+   * one (DERIVED_HOLDERS), whose resume pace it sets instead; 0 is a player pause.
+   */
+  setGameSpeed: (speed: number) => void;
+  /** Holds stacked over the clock, oldest first. Never persisted. */
+  clockHolds: ClockHold[];
+  /** Pause the clock for `holder`, remembering the pace to return to. */
+  holdClock: (holder: Exclude<ClockHolder, 'player'>) => void;
+  /**
+   * Release `holder`'s hold. Only the newest hold resumes the clock; releasing
+   * an older one passes its resume pace up. An acquisition restricts release to
+   * that exact live entry. Working if same-holder reentry keeps its newer hold.
+   * Returns false if it held nothing matching.
+   */
+  releaseClock: (holder: ClockHolder, acquisition?: ClockHold) => boolean;
+  /**
+   * An explicit "run" from a holder's own control: release its hold and, if the
+   * clock is still stopped underneath, start it at standard pace.
+   */
+  resumeClockFrom: (holder: Exclude<ClockHolder, 'player'>) => void;
+  /**
+   * Capture mode: the time of day (and so the sun, sky and lighting) stands
+   * still while the simulation keeps its pace. Set by the benchmark route; a
+   * page flag, never persisted.
+   */
+  timeOfDayHeld: boolean;
+  setTimeOfDayHeld: (held: boolean) => void;
+  tickGameTime: (deltaSeconds: number) => void;
+  resetGameState: () => void;
+  clearPersistedState: () => void;
+
+  weather: 'clear' | 'cloudy' | 'rain' | 'storm';
+  setWeather: (weather: GameSimulationStore['weather']) => void;
+
+  currentShift: RunWindow;
+  shiftStartTime: number;
+  shiftChangeActive: boolean;
+  setShift: (shift: RunWindow) => void;
+
+  emergencyActive: boolean;
+  emergencyMachineId: string | null;
+  emergencyDrillMode: boolean;
+  preEmergencyMachineStatuses: Map<string, string>;
+  safetyEvents: SafetyEventRecord[];
+  activeSafetyEventId: string | null;
+  triggerEmergency: (machineId: string) => void;
+  resolveEmergency: () => void;
+  startEmergencyDrill: (totalZones?: number) => void;
+  endEmergencyDrill: () => void;
+  acknowledgeSafetyEvent: (eventId: string, note?: string) => void;
+  drillMetrics: DrillMetrics;
+  markZoneVerified: (zoneId: string) => void;
+
+  crisisState: CrisisState;
+  triggerCrisis: (
+    type: CrisisType,
+    severity: CrisisSeverity,
+    metadata?: Record<string, unknown>
+  ) => void;
+  resolveCrisis: () => void;
+
+  celebrations: {
+    lastMilestone: number;
+    milestoneQueue: CelebrationEvent[];
+    zeroIncidentStreak: number;
+    celebrationActive: boolean;
+    packerBellEnabled: boolean;
+  };
+  triggerCelebration: (type: CelebrationType, data?: Partial<CelebrationEvent>) => void;
+  clearCelebration: () => void;
+  updateZeroIncidentStreak: (days: number) => void;
+  setPackerBellEnabled: (enabled: boolean) => void;
+}
+
+const MAX_SAFETY_EVENTS = 50;
+const MAX_DIRECT_TICK_DELTA_SECONDS = 1;
+const MAX_PERSISTED_CELEBRATION_SCAN = 50;
+
+export const getShiftForHour = (hour: number): RunWindow => {
+  const normalized = ((hour % 24) + 24) % 24;
+  if (normalized >= 6 && normalized < 14) return 'morning';
+  if (normalized >= 14 && normalized < 22) return 'afternoon';
+  return 'night';
+};
+
+/** When each shift window closes and its report is written (24-hour clock). */
+export const SHIFT_CLOSING_TIME: Record<RunWindow, string> = {
+  morning: '14:00',
+  afternoon: '22:00',
+  night: '06:00',
+};
+
+/**
+ * The key of the shift window the clock is in. Night runs 22:00 to 06:00 across
+ * midnight, so its hours after midnight belong to the day on which it started;
+ * keying by the current day split every night into a 2 h and a 6 h report.
+ * Working if 22:00 to 06:00 closes exactly one Night report.
+ */
+export function getShiftWindowKey(gameDay: number, gameTime: number, shift: RunWindow): string {
+  const day = shift === 'night' && gameTime < 6 ? Math.max(0, gameDay - 1) : gameDay;
+  return `day-${day}-${shift}`;
+}
+
+const defaultCrisis = (): CrisisState => ({
+  active: false,
+  type: null,
+  severity: 'medium',
+  startTime: 0,
+  metadata: {},
+});
+
+const defaultDrill = (): DrillMetrics => ({
+  active: false,
+  startTime: 0,
+  verifiedZoneIds: [],
+  totalZones: 0,
+  verificationComplete: false,
+  finalTimeSeconds: null,
+});
+
+const defaultCelebrations = (): GameSimulationStore['celebrations'] => ({
+  lastMilestone: 0,
+  milestoneQueue: [],
+  zeroIncidentStreak: 0,
+  celebrationActive: false,
+  packerBellEnabled: true,
+});
+
+const CELEBRATION_TYPES = new Set<CelebrationType>([
+  'milestone',
+  'zero_incident',
+  'target_met',
+  'shift_complete',
+]);
+
+const sanitizeCelebrationEvent = (value: unknown): CelebrationEvent | null => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Partial<CelebrationEvent>;
+  if (!source.type || !CELEBRATION_TYPES.has(source.type) || !Number.isFinite(source.timestamp)) {
+    return null;
+  }
+  const event: CelebrationEvent = { type: source.type, timestamp: source.timestamp as number };
+  if (typeof source.value === 'number' && Number.isFinite(source.value)) event.value = source.value;
+  if (typeof source.message === 'string') event.message = source.message.slice(0, 500);
+  if (
+    Array.isArray(source.position) &&
+    source.position.length === 3 &&
+    source.position.every((coordinate) => Number.isFinite(coordinate))
+  ) {
+    event.position = [...source.position] as [number, number, number];
+  }
+  return event;
+};
+
+const sanitizeCelebrations = (value: unknown): GameSimulationStore['celebrations'] => {
+  const defaults = defaultCelebrations();
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return defaults;
+  const source = value as Partial<GameSimulationStore['celebrations']>;
+  const milestoneQueue: CelebrationEvent[] = [];
+  if (Array.isArray(source.milestoneQueue)) {
+    const lowerBound = Math.max(0, source.milestoneQueue.length - MAX_PERSISTED_CELEBRATION_SCAN);
+    for (
+      let index = source.milestoneQueue.length - 1;
+      index >= lowerBound && milestoneQueue.length < 5;
+      index -= 1
+    ) {
+      const event = sanitizeCelebrationEvent(source.milestoneQueue[index]);
+      if (event) milestoneQueue.push(event);
+    }
+    milestoneQueue.reverse();
+  }
+  return {
+    lastMilestone:
+      typeof source.lastMilestone === 'number' && Number.isFinite(source.lastMilestone)
+        ? Math.min(100, Math.max(0, source.lastMilestone))
+        : defaults.lastMilestone,
+    milestoneQueue,
+    zeroIncidentStreak:
+      typeof source.zeroIncidentStreak === 'number' && Number.isFinite(source.zeroIncidentStreak)
+        ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(source.zeroIncidentStreak)))
+        : defaults.zeroIncidentStreak,
+    celebrationActive: milestoneQueue.length > 0,
+    packerBellEnabled:
+      typeof source.packerBellEnabled === 'boolean'
+        ? source.packerBellEnabled
+        : defaults.packerBellEnabled,
+  };
+};
+
+const stopProduction = (): Map<string, string> => {
+  const production = useProductionStore.getState();
+  const statuses = new Map<string, string>();
+  production.machines.forEach((machine) => {
+    statuses.set(machine.id, machine.status);
+    if (machine.status === 'running' || machine.status === 'warning') {
+      production.updateMachineStatus(machine.id, 'idle');
+    }
+  });
+  return statuses;
+};
+
+const restoreProduction = (statuses: Map<string, string>): void => {
+  const production = useProductionStore.getState();
+  statuses.forEach((status, machineId) => {
+    const machine = production.machines.find((candidate) => candidate.id === machineId);
+    if (machine?.status !== 'idle') return;
+    production.updateMachineStatus(
+      machineId,
+      status as 'running' | 'idle' | 'warning' | 'critical'
+    );
+  });
+};
+
+const eventId = (kind: SafetyEventKind): string =>
+  `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+/** The pace to persist: the player's choice underneath any session hold. */
+export function persistedGameSpeed(state: Pick<GameSimulationStore, 'gameSpeed' | 'clockHolds'>) {
+  const base = state.clockHolds[0];
+  if (state.gameSpeed > 0 || !base) return state.gameSpeed;
+  // Releasing every session hold would leave a player pause in place wherever
+  // it sits in the stack; otherwise the clock returns to the oldest resume pace.
+  return state.clockHolds.some((hold) => hold.holder === 'player') ? 0 : base.resumeSpeed;
+}
+
+/** Who holds the clock at 0, or null while it runs. Unrecorded holds read as the player's. */
+export function selectClockHolder(
+  state: Pick<GameSimulationStore, 'gameSpeed' | 'clockHolds'>
+): ClockHolder | null {
+  return state.gameSpeed > 0 ? null : (state.clockHolds.at(-1)?.holder ?? 'player');
+}
+
+/**
+ * The pace a pace control shows as chosen. Under a derived hold a chosen pace
+ * waits as the resume pace, so it is shown rather than 'Paused'.
+ * Working if every pace control agrees and a choice never appears to snap back.
+ */
+export function selectChosenPace(
+  state: Pick<GameSimulationStore, 'gameSpeed' | 'clockHolds'>
+): number {
+  const top = state.gameSpeed > 0 ? undefined : state.clockHolds.at(-1);
+  return top && DERIVED_HOLDERS.includes(top.holder) ? top.resumeSpeed : state.gameSpeed;
+}
+
+export const selectSafetyHoldActive = (
+  state: Pick<GameSimulationStore, 'emergencyActive' | 'emergencyDrillMode'>
+): boolean => state.emergencyActive || state.emergencyDrillMode;
+
+export const useGameSimulationStore = create<GameSimulationStore>()(
+  persist(
+    (set, get) => ({
+      isTabVisible: true,
+      setTabVisible: (visible) => set({ isTabVisible: visible }),
+
+      gameTime: 10,
+      gameDay: 0,
+      gameSpeed: STANDARD_GAME_SPEED,
+      setGameTime: (time) => {
+        if (!Number.isFinite(time)) return;
+        const gameTime = ((time % 24) + 24) % 24;
+        const currentShift = getShiftForHour(gameTime);
+        set((state) => ({
+          gameTime,
+          currentShift,
+          shiftStartTime: state.currentShift === currentShift ? state.shiftStartTime : Date.now(),
+        }));
+      },
+      setGameSpeed: (speed) => {
+        const gameSpeed = sanitizeGameSpeed(speed);
+        const { gameSpeed: current, clockHolds } = get();
+        if (gameSpeed > 0) {
+          const derived =
+            current === 0 ? clockHolds.filter((hold) => DERIVED_HOLDERS.includes(hold.holder)) : [];
+          set(
+            derived.length
+              ? { clockHolds: [{ ...derived[0], resumeSpeed: gameSpeed }, ...derived.slice(1)] }
+              : { gameSpeed, clockHolds: [] }
+          );
+          return;
+        }
+        if (current === 0 && clockHolds.at(-1)?.holder === 'player') return;
+        set({
+          gameSpeed: 0,
+          clockHolds: [
+            ...(current > 0 ? [] : clockHolds),
+            { holder: 'player', resumeSpeed: current > 0 ? current : 0 },
+          ],
+        });
+      },
+      clockHolds: [],
+      timeOfDayHeld: false,
+      setTimeOfDayHeld: (held) => set({ timeOfDayHeld: held }),
+      holdClock: (holder) => {
+        const { gameSpeed: current, clockHolds } = get();
+        if (current === 0 && clockHolds.at(-1)?.holder === holder) return;
+        // A positive pace means any recorded hold is stale (a direct setState).
+        const holds = current > 0 ? [] : clockHolds;
+        set({ gameSpeed: 0, clockHolds: [...holds, { holder, resumeSpeed: current }] });
+      },
+      releaseClock: (holder, acquisition) => {
+        const { gameSpeed: current, clockHolds } = get();
+        let index = -1;
+        for (let i = clockHolds.length - 1; i >= 0; i--)
+          if (
+            clockHolds[i].holder === holder &&
+            (acquisition === undefined || clockHolds[i] === acquisition)
+          ) {
+            index = i;
+            break;
+          }
+        if (index < 0) return false;
+        const released = clockHolds[index];
+        if (index < clockHolds.length - 1) {
+          const holds = clockHolds.slice();
+          holds[index + 1] = { ...holds[index + 1], resumeSpeed: released.resumeSpeed };
+          holds.splice(index, 1);
+          set({ clockHolds: holds });
+          return true;
+        }
+        const holds = clockHolds.slice(0, -1);
+        set(
+          current === 0
+            ? { gameSpeed: sanitizeGameSpeed(released.resumeSpeed), clockHolds: holds }
+            : { clockHolds: holds }
+        );
+        return true;
+      },
+      resumeClockFrom: (holder) => {
+        get().releaseClock(holder);
+        if (get().gameSpeed === 0) get().setGameSpeed(STANDARD_GAME_SPEED);
+      },
+      tickGameTime: (deltaSeconds) =>
+        set((state) => {
+          if (!Number.isFinite(deltaSeconds) || deltaSeconds <= 0) return {};
+          if (state.timeOfDayHeld) return {};
+          const gameSpeed = sanitizeGameSpeed(state.gameSpeed);
+          if (gameSpeed === 0) return {};
+          const safeDeltaSeconds = Math.min(deltaSeconds, MAX_DIRECT_TICK_DELTA_SECONDS);
+          const elapsedHours = (safeDeltaSeconds * gameSpeed) / 3600;
+          const currentGameTime = Number.isFinite(state.gameTime)
+            ? ((state.gameTime % 24) + 24) % 24
+            : 0;
+          const currentGameDay = Number.isFinite(state.gameDay)
+            ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(state.gameDay)))
+            : 0;
+          const unwrapped = currentGameTime + elapsedHours;
+          const gameTime = ((unwrapped % 24) + 24) % 24;
+          const dayIncrement = Math.max(0, Math.floor(unwrapped / 24));
+          const currentShift = getShiftForHour(gameTime);
+          return {
+            gameTime,
+            gameDay: Math.min(Number.MAX_SAFE_INTEGER, currentGameDay + dayIncrement),
+            currentShift,
+            shiftStartTime: state.currentShift === currentShift ? state.shiftStartTime : Date.now(),
+          };
+        }),
+      resetGameState: () =>
+        set({
+          gameTime: 10,
+          gameDay: 0,
+          gameSpeed: STANDARD_GAME_SPEED,
+          clockHolds: [],
+          currentShift: 'morning',
+          shiftStartTime: Date.now(),
+          shiftChangeActive: false,
+          weather: 'clear',
+          emergencyActive: false,
+          emergencyMachineId: null,
+          emergencyDrillMode: false,
+          preEmergencyMachineStatuses: new Map(),
+          safetyEvents: [],
+          activeSafetyEventId: null,
+          drillMetrics: defaultDrill(),
+          crisisState: defaultCrisis(),
+          celebrations: defaultCelebrations(),
+        }),
+      // 'Reset to 10 AM'. Customer orders keep their own campaign clock, as the
+      // confirm copy says. Working if the clock returns to 10:00 at the pace the
+      // operator chose: a paused (or save-halted) shift stays paused.
+      clearPersistedState: () => {
+        const { gameSpeed, clockHolds } = get();
+        localStorage.removeItem('millos-autonomous-simulation');
+        get().resetGameState();
+        set({ gameSpeed, clockHolds });
+      },
+
+      weather: 'clear',
+      setWeather: (weather) => set({ weather }),
+
+      currentShift: 'morning',
+      shiftStartTime: Date.now(),
+      shiftChangeActive: false,
+      setShift: (currentShift) =>
+        set((state) => ({
+          currentShift,
+          shiftStartTime: currentShift === state.currentShift ? state.shiftStartTime : Date.now(),
+          shiftChangeActive: false,
+        })),
+
+      emergencyActive: false,
+      emergencyMachineId: null,
+      emergencyDrillMode: false,
+      preEmergencyMachineStatuses: new Map(),
+      safetyEvents: [],
+      activeSafetyEventId: null,
+      triggerEmergency: (machineId) => {
+        const state = get();
+        if (state.emergencyActive || state.crisisState.active) return;
+        const id = eventId('facility_stop');
+        const event: SafetyEventRecord = {
+          id,
+          kind: 'facility_stop',
+          cause:
+            machineId === 'E-STOP'
+              ? translate(gameSimulationStoreMessages, 'facilityStopCause')
+              : translate(gameSimulationStoreMessages, 'interlockCause', { machineId }),
+          severity: 'critical',
+          simulated: true,
+          stage: 'active',
+          startedAt: Date.now(),
+          response: translate(gameSimulationStoreMessages, 'facilityStopResponse'),
+          recovery: translate(gameSimulationStoreMessages, 'facilityStopRecovery'),
+        };
+        set({
+          emergencyActive: true,
+          emergencyMachineId: machineId,
+          preEmergencyMachineStatuses: stopProduction(),
+          safetyEvents: [...state.safetyEvents, event].slice(-MAX_SAFETY_EVENTS),
+          activeSafetyEventId: id,
+        });
+        useSafetyStore.getState().setForkliftEmergencyStop(true);
+      },
+      resolveEmergency: () => {
+        const state = get();
+        // A drill is torn down only by endEmergencyDrill; resolving here would
+        // release the forklifts while drill mode and metrics stay active.
+        if (state.crisisState.active || state.emergencyDrillMode) return;
+        restoreProduction(state.preEmergencyMachineStatuses);
+        set({
+          emergencyActive: false,
+          emergencyMachineId: null,
+          preEmergencyMachineStatuses: new Map(),
+          activeSafetyEventId: null,
+          safetyEvents: state.safetyEvents.map((event) =>
+            event.id === state.activeSafetyEventId
+              ? {
+                  ...event,
+                  stage: 'cleared' as const,
+                  clearedAt: Date.now(),
+                  recovery: translate(gameSimulationStoreMessages, 'facilityStopCleared'),
+                }
+              : event
+          ),
+        });
+        useSafetyStore.getState().setForkliftEmergencyStop(false);
+        audioManager.stopEmergencyStopAlarm();
+      },
+      startEmergencyDrill: (totalZones = SERVICE_EGRESS_POINTS.length) => {
+        const state = get();
+        if (state.emergencyActive || state.crisisState.active) return;
+        // The sequencer can only verify the egress points that exist, so a larger
+        // count could never complete and a zero count would complete unverified.
+        const zones = Math.min(
+          Math.max(
+            1,
+            Number.isFinite(totalZones) ? Math.floor(totalZones) : SERVICE_EGRESS_POINTS.length
+          ),
+          SERVICE_EGRESS_POINTS.length
+        );
+        const id = eventId('fire_drill');
+        const event: SafetyEventRecord = {
+          id,
+          kind: 'fire_drill',
+          cause: translate(gameSimulationStoreMessages, 'drillCause'),
+          severity: 'medium',
+          simulated: true,
+          stage: 'active',
+          startedAt: Date.now(),
+          response: translate(gameSimulationStoreMessages, 'drillResponse'),
+          recovery: translate(gameSimulationStoreMessages, 'drillRecovery'),
+        };
+        set({
+          emergencyActive: true,
+          emergencyMachineId: 'DRILL',
+          emergencyDrillMode: true,
+          preEmergencyMachineStatuses: stopProduction(),
+          drillMetrics: {
+            active: true,
+            startTime: Date.now(),
+            verifiedZoneIds: [],
+            totalZones: zones,
+            verificationComplete: false,
+            finalTimeSeconds: null,
+          },
+          safetyEvents: [...state.safetyEvents, event].slice(-MAX_SAFETY_EVENTS),
+          activeSafetyEventId: id,
+        });
+        useSafetyStore.getState().setForkliftEmergencyStop(true);
+      },
+      endEmergencyDrill: () => {
+        const state = get();
+        if (!state.emergencyDrillMode) return;
+        restoreProduction(state.preEmergencyMachineStatuses);
+        set({
+          emergencyActive: false,
+          emergencyMachineId: null,
+          emergencyDrillMode: false,
+          preEmergencyMachineStatuses: new Map(),
+          drillMetrics: defaultDrill(),
+          activeSafetyEventId: null,
+          safetyEvents: state.safetyEvents.map((event) =>
+            event.id === state.activeSafetyEventId
+              ? {
+                  ...event,
+                  stage: 'cleared' as const,
+                  clearedAt: Date.now(),
+                  recovery: translate(gameSimulationStoreMessages, 'drillCleared'),
+                }
+              : event
+          ),
+        });
+        useSafetyStore.getState().setForkliftEmergencyStop(false);
+        audioManager.stopEmergencyStopAlarm();
+      },
+      acknowledgeSafetyEvent: (id, note) =>
+        set((state) => ({
+          safetyEvents: state.safetyEvents.map((event) =>
+            event.id === id && event.stage === 'active'
+              ? {
+                  ...event,
+                  stage: 'acknowledged' as const,
+                  acknowledgedAt: Date.now(),
+                  acknowledgementNote: note,
+                }
+              : event
+          ),
+        })),
+      drillMetrics: defaultDrill(),
+      markZoneVerified: (zoneId) =>
+        set((state) => {
+          if (!state.drillMetrics.active || state.drillMetrics.verifiedZoneIds.includes(zoneId)) {
+            return {};
+          }
+          const verifiedZoneIds = [...state.drillMetrics.verifiedZoneIds, zoneId];
+          const verificationComplete = verifiedZoneIds.length >= state.drillMetrics.totalZones;
+          return {
+            drillMetrics: {
+              ...state.drillMetrics,
+              verifiedZoneIds,
+              verificationComplete,
+              finalTimeSeconds: verificationComplete
+                ? (Date.now() - state.drillMetrics.startTime) / 1000
+                : null,
+            },
+          };
+        }),
+
+      crisisState: defaultCrisis(),
+      triggerCrisis: (type, severity, metadata = {}) => {
+        const state = get();
+        if (state.crisisState.active || state.emergencyActive) return;
+        const id = eventId('crisis');
+        const machineId = typeof metadata.machineId === 'string' ? metadata.machineId : undefined;
+        const interlocked = severity === 'high' || severity === 'critical';
+        const event: SafetyEventRecord = {
+          id,
+          kind: 'crisis',
+          cause: translate(gameSimulationStoreMessages, 'crisisCause', { type }),
+          severity,
+          simulated: true,
+          stage: 'active',
+          startedAt: Date.now(),
+          response: interlocked
+            ? translate(gameSimulationStoreMessages, 'crisisInterlockedResponse')
+            : translate(gameSimulationStoreMessages, 'crisisMonitoredResponse'),
+          recovery: translate(gameSimulationStoreMessages, 'crisisRecovery'),
+        };
+        set({
+          crisisState: {
+            active: true,
+            type,
+            severity,
+            startTime: Date.now(),
+            affectedMachineId: machineId,
+            metadata,
+          },
+          emergencyActive: interlocked,
+          emergencyMachineId: interlocked ? (machineId ?? `CRISIS-${type}`) : null,
+          preEmergencyMachineStatuses: interlocked ? stopProduction() : new Map(),
+          safetyEvents: [...state.safetyEvents, event].slice(-MAX_SAFETY_EVENTS),
+          activeSafetyEventId: id,
+        });
+        if (interlocked) useSafetyStore.getState().setForkliftEmergencyStop(true);
+      },
+      resolveCrisis: () => {
+        const state = get();
+        if (!state.crisisState.active) return;
+        restoreProduction(state.preEmergencyMachineStatuses);
+        set({
+          crisisState: defaultCrisis(),
+          emergencyActive: false,
+          emergencyMachineId: null,
+          preEmergencyMachineStatuses: new Map(),
+          activeSafetyEventId: null,
+          safetyEvents: state.safetyEvents.map((event) =>
+            event.id === state.activeSafetyEventId
+              ? {
+                  ...event,
+                  stage: 'cleared' as const,
+                  clearedAt: Date.now(),
+                  recovery: translate(gameSimulationStoreMessages, 'crisisCleared'),
+                }
+              : event
+          ),
+        });
+        useSafetyStore.getState().setForkliftEmergencyStop(false);
+        audioManager.stopEmergencyStopAlarm();
+      },
+
+      celebrations: defaultCelebrations(),
+      triggerCelebration: (type, data = {}) =>
+        set((state) => {
+          const event = sanitizeCelebrationEvent({ ...data, type, timestamp: Date.now() });
+          if (!event) return {};
+          return {
+            celebrations: {
+              ...state.celebrations,
+              lastMilestone:
+                type === 'milestone' && typeof event.value === 'number'
+                  ? Math.min(100, Math.max(0, event.value))
+                  : state.celebrations.lastMilestone,
+              milestoneQueue: [
+                ...(Array.isArray(state.celebrations.milestoneQueue)
+                  ? state.celebrations.milestoneQueue
+                  : []),
+                event,
+              ].slice(-5),
+              celebrationActive: true,
+            },
+          };
+        }),
+      clearCelebration: () =>
+        set((state) => ({
+          celebrations: {
+            ...state.celebrations,
+            milestoneQueue: state.celebrations.milestoneQueue.slice(1),
+            celebrationActive: state.celebrations.milestoneQueue.length > 1,
+          },
+        })),
+      updateZeroIncidentStreak: (days) =>
+        set((state) => {
+          if (!Number.isFinite(days)) return {};
+          return {
+            celebrations: {
+              ...state.celebrations,
+              zeroIncidentStreak: Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(days))),
+            },
+          };
+        }),
+      setPackerBellEnabled: (enabled) =>
+        set((state) => ({
+          celebrations: { ...state.celebrations, packerBellEnabled: enabled },
+        })),
+    }),
+    {
+      name: 'millos-autonomous-simulation',
+      // v2: one time model. Version 1 saves wrote 180 as "Standard, 1x".
+      version: 2,
+      storage: safeJSONStorage,
+      migrate: (persisted, version) => {
+        const record =
+          persisted !== null && typeof persisted === 'object' && !Array.isArray(persisted)
+            ? (persisted as Record<string, unknown>)
+            : {};
+        return version < 2 && typeof record.gameSpeed === 'number'
+          ? { ...record, gameSpeed: migrateLegacyGameSpeed(record.gameSpeed) }
+          : record;
+      },
+      partialize: (state) => ({
+        gameTime: state.gameTime,
+        gameDay: state.gameDay,
+        // A hold belongs to this page; persist the pace the player had chosen
+        // underneath it, so a reload never inherits a tour or restore pause.
+        gameSpeed: persistedGameSpeed(state),
+        weather: state.weather,
+        currentShift: state.currentShift,
+        celebrations: state.celebrations,
+      }),
+      merge: (persisted, current) => {
+        const persistedRecord =
+          persisted !== null && typeof persisted === 'object' && !Array.isArray(persisted)
+            ? (persisted as Partial<GameSimulationStore>)
+            : undefined;
+        const state = sanitizeGameSimulationState(persistedRecord);
+        const gameTime = state.gameTime ?? current.gameTime;
+        return {
+          ...current,
+          ...state,
+          currentShift: getShiftForHour(gameTime),
+          celebrations: sanitizeCelebrations(persistedRecord?.celebrations),
+          preEmergencyMachineStatuses: new Map(),
+          emergencyActive: false,
+          emergencyMachineId: null,
+          emergencyDrillMode: false,
+          activeSafetyEventId: null,
+          drillMetrics: defaultDrill(),
+          crisisState: defaultCrisis(),
+        };
+      },
+    }
+  )
+);

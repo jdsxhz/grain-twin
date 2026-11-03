@@ -1,0 +1,205 @@
+import * as THREE from 'three';
+
+const DEFAULT_SEGMENTS = 72;
+export const LAKE_BED_RIM = 0.94;
+export const LAKE_SHALLOW_DEPTH = 0.12;
+
+/** Shared optical/physical profile, metres below the .15m water datum. */
+export function lakeBedDepth(radius: number, depth: number): number {
+  return THREE.MathUtils.lerp(
+    LAKE_SHALLOW_DEPTH,
+    depth,
+    1 - THREE.MathUtils.smoothstep(radius, 0.42, 1)
+  );
+}
+
+function shorelineFactor(angle: number, seed: number): number {
+  return (
+    1 +
+    Math.sin(angle * 3 + seed) * 0.055 +
+    Math.sin(angle * 5 - seed * 1.7) * 0.035 +
+    Math.sin(angle * 11 + seed * 0.6) * 0.015
+  );
+}
+
+/**
+ * Build a softly irregular lake with concentric radial subdivisions. The extra
+ * rings let vertex waves bend continuously across the surface instead of
+ * stretching one centre-to-shore triangle over the full lake radius.
+ */
+export function createOrganicLakeSurfaceGeometry(
+  radiusX: number,
+  radiusZ: number,
+  segments = DEFAULT_SEGMENTS,
+  seed = 0.74,
+  radialSegments = 6
+): THREE.BufferGeometry {
+  const safeRadiusX = Math.max(0.1, radiusX);
+  const safeRadiusZ = Math.max(0.1, radiusZ);
+  const safeSegments = Math.max(12, Math.floor(segments));
+  const safeRadialSegments = Math.max(2, Math.floor(radialSegments));
+  const positions: number[] = [0, 0, 0];
+  const uvs: number[] = [0.5, 0.5];
+  const indices: number[] = [];
+
+  for (let ring = 1; ring <= safeRadialSegments; ring += 1) {
+    const radialRatio = ring / safeRadialSegments;
+    for (let segment = 0; segment <= safeSegments; segment += 1) {
+      const progress = segment === safeSegments ? 0 : segment / safeSegments;
+      const angle = progress * Math.PI * 2;
+      const edgeFactor = shorelineFactor(angle, seed);
+      const factor = THREE.MathUtils.lerp(1, edgeFactor, radialRatio * radialRatio);
+      const x = Math.cos(angle) * safeRadiusX * radialRatio * factor;
+      const z = Math.sin(angle) * safeRadiusZ * radialRatio * factor;
+      positions.push(x, z, 0);
+      uvs.push(
+        0.5 + Math.cos(angle) * radialRatio * 0.5,
+        0.5 + Math.sin(angle) * radialRatio * 0.5
+      );
+    }
+  }
+
+  for (let segment = 0; segment < safeSegments; segment += 1) {
+    indices.push(0, 1 + segment, 2 + segment);
+  }
+  const ringStride = safeSegments + 1;
+  for (let ring = 1; ring < safeRadialSegments; ring += 1) {
+    const innerStart = 1 + (ring - 1) * ringStride;
+    const outerStart = innerStart + ringStride;
+    for (let segment = 0; segment < safeSegments; segment += 1) {
+      const innerLeft = innerStart + segment;
+      const innerRight = innerLeft + 1;
+      const outerLeft = outerStart + segment;
+      const outerRight = outerLeft + 1;
+      indices.push(innerLeft, outerLeft, innerRight, innerRight, outerLeft, outerRight);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+/**
+ * Build one non-overlapping bank mesh with a damp inner edge, aggregate
+ * middle, and grass-tinted outer transition.
+ */
+export function createOrganicLakeBankGeometry(
+  waterRadiusX: number,
+  waterRadiusZ: number,
+  shoreRadiusX: number,
+  shoreRadiusZ: number,
+  segments = DEFAULT_SEGMENTS,
+  seed = 0.74
+): THREE.BufferGeometry {
+  const safeSegments = Math.max(12, Math.floor(segments));
+  const rows = 5;
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  const rowColors = [
+    new THREE.Color('#8a9a89'),
+    new THREE.Color('#c1b9a1'),
+    new THREE.Color('#ebe0c5'),
+    new THREE.Color('#b3bd94'),
+    new THREE.Color('#a2bd83'),
+  ];
+  // The bank is placed at world y=0.08. Sink its outside edge through the
+  // ground datum (-0.02), rather than leaving a raised cut edge above the lawn.
+  // A shallow gravel shoulder rises above the .15m water line. The old .175m
+  // maximum left only 25mm exposed, so the shoreline read as submerged lawn.
+  const rowHeights = [-0.05, 0.07, 0.19, 0.075, -0.12] as const;
+  const grassEdge = rowColors[4];
+  const colour = new THREE.Color();
+
+  for (let segment = 0; segment <= safeSegments; segment += 1) {
+    const progress = segment === safeSegments ? 0 : segment / safeSegments;
+    const angle = progress * Math.PI * 2;
+    const innerFactor = shorelineFactor(angle, seed);
+    const outerFactor =
+      innerFactor + Math.sin(angle * 7 - seed * 2.1) * 0.01 + Math.sin(angle * 13 + seed) * 0.006;
+
+    // Broad banks alternate with narrow vegetated reaches, wholly inside the
+    // existing footprint. The water's outline remains the shared inner curve.
+    const width = 0.65 + Math.sin(angle * 3 + seed) * 0.2 + Math.sin(angle * 7 - seed) * 0.1;
+    const bankRadiusX = THREE.MathUtils.lerp(waterRadiusX, shoreRadiusX, width);
+    const bankRadiusZ = THREE.MathUtils.lerp(waterRadiusZ, shoreRadiusZ, width);
+    const vegetation = (Math.sin(angle * 3 - seed * 2) * 0.5 + 0.5) * 0.65;
+
+    for (let row = 0; row < rows; row += 1) {
+      const baseRatio = row / (rows - 1);
+      // Vary the width of each band without moving either boundary or adding
+      // vertices. The bounded derivative stays positive, so rows cannot fold.
+      const sweep = Math.sin(angle * 3 + seed) * 0.08 + Math.sin(angle * 7 - seed) * 0.035;
+      // Row1 IS the rendered water boundary, pinned at world .15m. Row0
+      // continues below it into the basin. Five rows retain reed-root sampling.
+      const ratio = row < 2 ? 0 : (row - 1) / 3 + sweep * Math.sin((Math.PI * (row - 1)) / 3);
+      const innerScale = row === 0 ? LAKE_BED_RIM : 1;
+      const radiusX = THREE.MathUtils.lerp(waterRadiusX * innerScale, bankRadiusX, ratio);
+      const radiusZ = THREE.MathUtils.lerp(waterRadiusZ * innerScale, bankRadiusZ, ratio);
+      const factor = THREE.MathUtils.lerp(innerFactor, outerFactor, ratio);
+      positions.push(
+        Math.cos(angle) * radiusX * factor,
+        Math.sin(angle) * radiusZ * factor,
+        rowHeights[row] +
+          (row > 1 ? Math.sin(angle * 5 + seed) * 0.018 * Math.sin(Math.PI * baseRatio) : 0)
+      );
+      // World-metre grain density follows the bank, independent of ring width.
+      uvs.push((Math.cos(angle) * radiusX * factor) / 2, (Math.sin(angle) * radiusZ * factor) / 2);
+      colour.copy(rowColors[row]).lerp(grassEdge, vegetation * Math.sin(Math.PI * baseRatio));
+      const shade = 0.94 + 0.06 * Math.sin(angle * 4 + seed + baseRatio * 2);
+      colors.push(colour.r * shade, colour.g * shade, colour.b * shade);
+    }
+  }
+
+  for (let segment = 0; segment < safeSegments; segment += 1) {
+    for (let row = 0; row < rows - 1; row += 1) {
+      const innerLeft = segment * rows + row;
+      const innerRight = (segment + 1) * rows + row;
+      const outerLeft = innerLeft + 1;
+      const outerRight = innerRight + 1;
+      indices.push(innerLeft, outerLeft, innerRight, innerRight, outerLeft, outerRight);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+/** Lit mineral basin, physically below all wave troughs. Its outer vertices
+ * meet bank row0 exactly, with a half-metre centre and a .12m shallow shelf.
+ */
+export function createOrganicLakeBedGeometry(radiusX: number, radiusZ: number, depth = 0.5) {
+  const geometry = createOrganicLakeSurfaceGeometry(radiusX, radiusZ, DEFAULT_SEGMENTS, 0.74, 12);
+  const p = geometry.getAttribute('position'),
+    uv = geometry.getAttribute('uv');
+  const colors: number[] = [];
+  const silt = new THREE.Color('#869581'),
+    gravel = new THREE.Color('#d1c19c'),
+    c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    const r = Math.min(1, Math.hypot(uv.getX(i) - 0.5, uv.getY(i) - 0.5) * 2);
+    p.setXYZ(i, p.getX(i) * LAKE_BED_RIM, p.getY(i) * LAKE_BED_RIM, -lakeBedDepth(r, depth));
+    uv.setXY(i, p.getX(i) / 1.7, p.getY(i) / 1.7);
+    c.copy(silt).lerp(gravel, THREE.MathUtils.smoothstep(r, 0.45, 0.95));
+    const shade = 0.94 + 0.06 * Math.sin(p.getX(i) * 0.8 + p.getY(i) * 0.47);
+    colors.push(c.r * shade, c.g * shade, c.b * shade);
+  }
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geometry.name = 'lake-mineral-basin';
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  return geometry;
+}

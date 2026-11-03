@@ -1,0 +1,118 @@
+/**
+ * StrategicOverlay3D Component
+ *
+ * Floating 3D text above the factory showing current strategic priority.
+ * Uses showStrategicOverlay toggle from aiConfigStore (default OFF).
+ */
+
+import React, { useMemo } from 'react';
+import { Billboard } from '@react-three/drei';
+import { SceneText as Text } from './shared/SceneText';
+import { useAIConfigStore } from '../stores/aiConfigStore';
+import { useFrame } from '@react-three/fiber';
+import * as THREE from 'three';
+import { useReducedMotion } from '../hooks/useReducedMotion';
+import { useT } from '../i18n';
+import { strategicOverlay3DMessages } from './StrategicOverlay3D.messages';
+
+export const StrategicOverlay3D: React.FC = () => {
+  const showStrategicOverlay = useAIConfigStore((state) => state.showStrategicOverlay);
+  const strategic = useAIConfigStore((state) => state.strategic);
+  const reducedMotion = useReducedMotion();
+  const t = useT(strategicOverlay3DMessages);
+
+  // Animated border glow. The backdrop behind the text stays at a constant
+  // opacity so the priority's contrast never breathes.
+  const materialRef = React.useRef<THREE.MeshBasicMaterial>(null);
+
+  useFrame((state) => {
+    if (!showStrategicOverlay || !materialRef.current) return;
+    materialRef.current.opacity = reducedMotion
+      ? 0.3
+      : 0.3 + Math.sin(state.clock.elapsedTime * 2) * 0.1;
+  });
+
+  // Get the top priority - prefer legacy string priorities for display, fall back to structured
+  const topPriority = useMemo(() => {
+    // First try legacy string priorities (human-readable)
+    const legacyPriorities = strategic.legacyPriorities || [];
+    if (legacyPriorities.length > 0) {
+      const priority = legacyPriorities[0];
+      return priority.length > 50 ? priority.slice(0, 47) + '...' : priority;
+    }
+    // Fall back to structured priorities
+    if (strategic.priorities.length > 0) {
+      const priority = strategic.priorities[0].priority;
+      return priority.length > 50 ? priority.slice(0, 47) + '...' : priority;
+    }
+    // The fallback is resolved at render so it follows the active language.
+    return null;
+  }, [strategic.priorities, strategic.legacyPriorities]);
+
+  // Don't render if toggle is off
+  if (!showStrategicOverlay) return null;
+
+  return (
+    <group position={[0, 18, 0]}>
+      <Billboard follow lockX={false} lockY={false} lockZ={false}>
+        {/* Background panel - depthWrite false to prevent z-fighting */}
+        <mesh position={[0, 0, -0.1]}>
+          <planeGeometry args={[25, 2.5]} />
+          <meshBasicMaterial color="#0f172a" transparent opacity={0.85} depthWrite={false} />
+        </mesh>
+
+        {/* Border glow - depthWrite false to prevent z-fighting */}
+        <mesh position={[0, 0, -0.15]}>
+          <planeGeometry args={[25.2, 2.7]} />
+          <meshBasicMaterial
+            ref={materialRef}
+            color="#06b6d4"
+            transparent
+            opacity={0.3}
+            depthWrite={false}
+          />
+        </mesh>
+
+        {/* Label */}
+        <Text
+          position={[0, 0.6, 0]}
+          fontSize={0.4}
+          color="#06b6d4"
+          anchorX="center"
+          anchorY="middle"
+          outlineWidth={0.02}
+          outlineColor="#000"
+        >
+          {t('heading')}
+        </Text>
+
+        {/* Priority text */}
+        <Text
+          position={[0, -0.3, 0]}
+          fontSize={0.6}
+          color="#ffffff"
+          anchorX="center"
+          anchorY="middle"
+          outlineWidth={0.03}
+          outlineColor="#000"
+          maxWidth={24}
+        >
+          {topPriority ?? t('noPriorities')}
+        </Text>
+
+        {/* Thinking indicator */}
+        {strategic.isThinking && (
+          <Text
+            position={[0, -1.0, 0]}
+            fontSize={0.3}
+            color="#f59e0b"
+            anchorX="center"
+            anchorY="middle"
+          >
+            {t('thinking')}
+          </Text>
+        )}
+      </Billboard>
+    </group>
+  );
+};

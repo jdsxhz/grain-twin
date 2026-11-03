@@ -1,0 +1,808 @@
+import { beforeEach, afterEach, expect, it, vi } from 'vitest';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import * as ts from 'typescript';
+
+// These tick the real engine (and, for the truck tests, the real yard at 60
+// render frames per tick) through whole programmes; that work is the
+// assertion. Measured with --maxWorkers=1 at ~57 runnable per core
+// (2026-10-20): the slowest, programmes 2-4 plus a night programme, took
+// 57.9 s, the pace-15 guided programme 42.3 s and the rush cases 12-22 s; the
+// lead's gate at ~30-44 per core saw 12.4-12.5 s against the 10 s default.
+// Snapshotting programme 1 to share it would have to capture module state in
+// UnifiedGameTick and the truck controllers, so each test still runs it.
+vi.setConfig({ testTimeout: 180_000 });
+import { SITE_LAYOUT } from '../../constants/siteLayout';
+import { MachineType, type MachineData } from '../../types';
+import { centralTick } from '../../systems/CentralTickSystem';
+import { resetUnifiedTickState, unifiedGameTick } from '../../systems/UnifiedGameTick';
+import { useProductionStore } from '../../stores/productionStore';
+import { useMaterialFlowStore } from '../../stores/materialFlowStore';
+import { useOperationsCampaignStore } from '../../stores/operationsCampaignStore';
+import { useGameSimulationStore } from '../../stores/gameSimulationStore';
+import { useTruckScheduleStore } from '../../stores/truckScheduleStore';
+import { useBreakdownStore } from '../../stores/breakdownStore';
+import { useQCLabStore } from '../../stores/qcLabStore';
+import { hasCommunityBakerySupply } from '../../simulation/communityLife';
+import { deriveDeliveryJourney } from '../../components/ui-new/onboarding/deliveryJourney';
+import { toSimulationMinutes } from '../../simulation/simulationClock';
+import type { OperationsChallengeId } from '../../simulation/operationsPlay';
+import {
+  createTruckController,
+  stepTruckController,
+  type TruckControllerState,
+} from '../../components/truckbay/truckController';
+import type { TruckAnimState } from '../../components/truckbay/useTruckPhysics';
+import type { TruckLifecyclePhase } from '../../stores/truckScheduleStore';
+import {
+  advanceTruckClock,
+  TRUCK_CONTROLLER_STEP_SECONDS,
+} from '../../components/truckbay/truckClock';
+import { PACE_GAME_SPEEDS, STANDARD_GAME_SPEED } from '../../simulation/pace';
+import { createElement } from 'react';
+import { cleanup, render, screen } from '@testing-library/react';
+import {
+  FirstDeliveryJourney,
+  ShiftDebrief,
+} from '../../components/ui-new/onboarding/PlayableShift';
+import { useUIStore } from '../../stores/uiStore';
+import { setLocale } from '../../i18n';
+
+// Execute the actual current scene's roster factory, rather than duplicating a
+// machine table. The final lane also couples the real truck controller and dock
+// predicates. WebGL, React input and rendered truck motion remain native gates.
+const sceneFile = ts.createSourceFile(
+  'MillScene.tsx',
+  readFileSync('src/components/MillScene.tsx', 'utf8'),
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX
+);
+const bodies: string[] = [];
+function findRoster(node: ts.Node) {
+  if (
+    ts.isVariableDeclaration(node) &&
+    node.name.getText(sceneFile) === 'machines' &&
+    node.initializer &&
+    ts.isCallExpression(node.initializer) &&
+    node.initializer.expression.getText(sceneFile) === 'useMemo'
+  ) {
+    const factory = node.initializer.arguments[0];
+    if (factory && ts.isArrowFunction(factory)) bodies.push(factory.body.getText(sceneFile));
+  }
+  ts.forEachChild(node, findRoster);
+}
+findRoster(sceneFile);
+expect(bodies).toHaveLength(1);
+const rosterJS = ts.transpileModule(`function buildRoster() ${bodies[0]}`, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+}).outputText;
+const makeRoster = new Function(
+  'SITE_LAYOUT',
+  'MachineType',
+  `${rosterJS}; return buildRoster();`
+) as (layout: typeof SITE_LAYOUT, types: typeof MachineType) => MachineData[];
+const deltaSeconds = centralTick.getStats().tickInterval;
+const morningWindowTicks = Math.ceil((240 * 60) / (STANDARD_GAME_SPEED * deltaSeconds)) + 1;
+let tickCount = 0;
+let receivingDwell = 0;
+let fetchCalls = 0;
+let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  resetUnifiedTickState();
+  useMaterialFlowStore.getState().resetMaterialFlow();
+  useOperationsCampaignStore.getState().resetCampaign();
+  useGameSimulationStore.getState().resetGameState();
+  useTruckScheduleStore.getState().resetTruckSchedule();
+  useBreakdownStore.getState().resetBreakdownStore();
+  useQCLabStore.getState().resetQCLab();
+  useProductionStore.setState({
+    ...useProductionStore.getInitialState(),
+    machines: makeRoster(SITE_LAYOUT, MachineType),
+    productionSpeed: 1,
+  });
+  expect(
+    useProductionStore
+      .getState()
+      .machines.map((m) => m.id)
+      .sort()
+  ).toEqual([...useMaterialFlowStore.getState().machineBuffers.keys()].sort());
+  fetchCalls = 0;
+  fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+    fetchCalls++;
+    return Promise.reject(new Error('Optional services unavailable for offline audit'));
+  });
+  tickCount = 0;
+  receivingDwell = 0;
+});
+
+afterEach(() => {
+  fetchSpy.mockRestore();
+  expect(fetchCalls).toBe(0);
+  expect(Math.abs(useMaterialFlowStore.getState().getMaterialBalance().errorKg)).toBeLessThan(
+    0.001
+  );
+  expect(Math.abs(useMaterialFlowStore.getState().getGenealogyBalance().errorKg)).toBeLessThan(
+    0.001
+  );
+});
+
+function step(gameSpeed = useGameSimulationStore.getState().gameSpeed) {
+  // Public dock transitions supply only lifecycle signals. Flour, lot genealogy,
+  // loading amounts, manifests and campaign credit are exclusively computed by
+  // the production/material/campaign authorities.
+  const trucks = useTruckScheduleStore.getState();
+  for (const dock of ['receiving', 'shipping'] as const) {
+    const schedule = trucks.truckSchedule[dock];
+    if (schedule.truckActive && !schedule.truckDocked) {
+      trucks.setTruckDocked(dock, true);
+      trucks.setTruckTransferReady(dock, true);
+    }
+  }
+  unifiedGameTick({
+    deltaSeconds,
+    gameSpeed,
+    gameTime: useGameSimulationStore.getState().gameTime,
+    elapsedTime: tickCount * deltaSeconds,
+    tickCount: ++tickCount,
+  });
+  const campaign = useOperationsCampaignStore.getState();
+  if (
+    campaign.execution.dispatchLoad.status === 'ready' &&
+    useTruckScheduleStore.getState().truckSchedule.shipping.transferReady
+  ) {
+    useTruckScheduleStore.getState().recordTruckDeparture(
+      'shipping',
+      toSimulationMinutes({
+        day: useGameSimulationStore.getState().gameDay,
+        hour: useGameSimulationStore.getState().gameTime,
+      })
+    );
+  }
+  if (
+    useTruckScheduleStore.getState().truckSchedule.receiving.transferReady &&
+    ++receivingDwell >= 3
+  ) {
+    useTruckScheduleStore.getState().recordTruckDeparture(
+      'receiving',
+      toSimulationMinutes({
+        day: useGameSimulationStore.getState().gameDay,
+        hour: useGameSimulationStore.getState().gameTime,
+      })
+    );
+    receivingDwell = 0;
+  }
+}
+
+it('fulfils the bakery commitment within its actual default-speed morning window', () => {
+  expect(useGameSimulationStore.getState().gameSpeed).toBe(STANDARD_GAME_SPEED);
+  for (let i = 0; i < morningWindowTicks; i++) step();
+
+  const campaign = useOperationsCampaignStore.getState();
+  expect(campaign.orders[0]).toMatchObject({ status: 'fulfilled', qualityFailureKg: 0 });
+  expect(campaign.orders[0].completedAtMinute).toBeLessThanOrEqual(campaign.orders[0].dueAtMinute);
+  expect(hasCommunityBakerySupply(campaign.orders, campaign.elapsedMinutes)).toBe(true);
+  expect(campaign.reports.length).toBeGreaterThan(0);
+});
+
+// The ordinary path to a shift review: the real tick closes the 10:00-14:00
+// Morning, announces it, and the debrief reads it in the player's language.
+it.each([
+  ['en', /^Morning shift closed: grade [A-F]$/, 'Shift debrief', /delivered on time\.$/],
+  ['pt-BR', /^Turno da manhã encerrado: nota [A-F]$/, 'Balanço do turno', /entregue no prazo\.$/],
+] as const)('closes, announces and reviews the Morning in %s', (locale, title, heading, onTime) => {
+  setLocale(locale);
+  try {
+    for (let i = 0; i < morningWindowTicks; i++) step();
+    const report = useOperationsCampaignStore.getState().reports[0];
+    expect(report).toMatchObject({ shiftKey: 'day-0-morning', grade: expect.any(String) });
+    expect(report.orderOutcomes?.[0]?.id).toBe('order-001');
+    expect(report.orderOutcomes?.[0]?.shippedKg).toBeCloseTo(6000, 6);
+    const notice = useUIStore.getState().alerts.find((a) => a.id === `shift-review-${report.id}`);
+    expect(notice?.title).toMatch(title);
+    render(createElement(ShiftDebrief));
+    expect(screen.getByRole('heading', { name: heading })).toBeVisible();
+    expect(screen.getByText(new RegExp(`^Riverside Bakers' Cooperative: .*`))).toHaveTextContent(
+      onTime
+    );
+  } finally {
+    cleanup();
+    setLocale('en');
+  }
+});
+
+it('teaches remaining loads after an actual underfilled departure', () => {
+  while (!useMaterialFlowStore.getState().productionBatches.some((batch) => batch.availableKg > 0))
+    step();
+  useProductionStore.getState().setProductionSpeed(0);
+  for (let i = 0; i < 200 && useMaterialFlowStore.getState().shippedKg === 0; i++) step();
+  const campaign = useOperationsCampaignStore.getState();
+  const order = campaign.orders[0];
+  expect(order.shippedKg).toBeGreaterThan(0);
+  expect(order.shippedKg).toBeLessThan(1000);
+  expect(campaign.execution.stage).toBe('dispatched');
+  expect(order.requiredKg - order.shippedKg).toBeGreaterThan(
+    campaign.execution.dispatchLoad.capacityKg
+  );
+  const before = JSON.stringify({
+    execution: campaign.execution,
+    orders: campaign.orders,
+    balance: useMaterialFlowStore.getState().getMaterialBalance(),
+  });
+  const evidence = [];
+  try {
+    useUIStore.getState().startDeliveryJourney(order.id);
+    useUIStore.getState().recordMachineInspection('rm-101');
+    for (const locale of ['en', 'pt-BR'] as const) {
+      setLocale(locale);
+      const guide = deriveDeliveryJourney(order, campaign.execution, true);
+      const expected =
+        locale === 'en' ? 'At least 2 loads needed' : 'São necessárias pelo menos 2 cargas';
+      expect(guide.detail).toContain(expected);
+      expect(guide.detail).not.toMatch(/Truck 2 of 2|Caminhão 2 de 2/);
+      const { container } = render(
+        createElement(FirstDeliveryJourney, {
+          selectedMachine: null,
+          onOpenWorkspace: () => {},
+        })
+      );
+      expect(container.textContent).toContain(expected);
+      evidence.push({
+        locale,
+        guide,
+        html: container.innerHTML,
+        exactText: container.textContent,
+        controls: container.querySelectorAll('button,select,input').length,
+      });
+      const output = process.env.MILLOS_DELIVERY_EVIDENCE_DIR;
+      if (output) {
+        mkdirSync(output, { recursive: true });
+        writeFileSync(
+          `${output}/partial-trip-${locale}.html`,
+          `<!doctype html><html lang="${locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>${container.innerHTML}</body></html>`
+        );
+      }
+      cleanup();
+    }
+  } finally {
+    cleanup();
+    setLocale('en');
+  }
+  expect(
+    JSON.stringify({
+      execution: campaign.execution,
+      orders: campaign.orders,
+      balance: useMaterialFlowStore.getState().getMaterialBalance(),
+    })
+  ).toBe(before);
+  const output = process.env.MILLOS_DELIVERY_EVIDENCE_DIR;
+  if (output)
+    writeFileSync(
+      `${output}/partial-trip-domain.json`,
+      JSON.stringify(
+        {
+          scope:
+            'Existing real roster/unified tick stores and actual FirstDeliveryJourney DOM; dock lifecycle fixture, no human/device acceptance',
+          requiredKg: order.requiredKg,
+          shippedKg: order.shippedKg,
+          remainingKg: order.requiredKg - order.shippedKg,
+          capacityKg: campaign.execution.dispatchLoad.capacityKg,
+          manifests: useMaterialFlowStore
+            .getState()
+            .manifests.filter((manifest) => manifest.kind === 'shipping'),
+          balance: useMaterialFlowStore.getState().getMaterialBalance(),
+          evidence,
+        },
+        null,
+        2
+      )
+    );
+});
+
+it('recovers actual certification hold and dispatches within the default morning window', () => {
+  useQCLabStore.getState().updateCertificationStatus('expired');
+  for (let i = 0; i < 30; i++) step();
+  expect(useMaterialFlowStore.getState().shippedKg).toBe(0);
+  expect(
+    useMaterialFlowStore.getState().productionBatches.some((batch) => batch.availableKg > 0)
+  ).toBe(true);
+  expect(useOperationsCampaignStore.getState().execution.stage).toBe('quality_hold');
+  const campaign = useOperationsCampaignStore.getState();
+  const order = campaign.orders.find((item) => item.id === campaign.activeOrderId)!;
+  expect(campaign.execution.dispatchLoad.blockCode).toBe('certificationExpired');
+  expect(
+    useMaterialFlowStore
+      .getState()
+      .productionBatches.every((batch) => batch.disposition === 'released')
+  ).toBe(true);
+  const before = JSON.stringify({
+    execution: campaign.execution,
+    orders: campaign.orders,
+    qc: useQCLabStore.getState().qcLab,
+    material: useMaterialFlowStore.getState().getMaterialBalance(),
+  });
+  const evidence = [];
+  try {
+    useUIStore.getState().startDeliveryJourney(order.id);
+    useUIStore.getState().recordMachineInspection('rm-101');
+    for (const locale of ['en', 'pt-BR'] as const) {
+      setLocale(locale);
+      const guide = deriveDeliveryJourney(order, campaign.execution, true);
+      const cause =
+        locale === 'en'
+          ? 'Quality certification is expired.'
+          : 'A certificação de qualidade está vencida.';
+      expect(guide.detail).toContain(cause);
+      expect(guide.detail).not.toMatch(/QC batch hold|retenção de lote do CQ/);
+      const { container } = render(
+        createElement(FirstDeliveryJourney, {
+          selectedMachine: null,
+          onOpenWorkspace: () => {},
+        })
+      );
+      expect(container.textContent).toContain(cause);
+      expect(container.textContent).toContain(
+        locale === 'en' ? 'can also block all dispatch.' : 'também podem bloquear toda a expedição.'
+      );
+      const html = container.innerHTML;
+      evidence.push({
+        locale,
+        guide,
+        html,
+        exactText: container.textContent,
+        controls: container.querySelectorAll('button,select,input').length,
+      });
+      const output = process.env.MILLOS_DELIVERY_EVIDENCE_DIR;
+      if (output) {
+        mkdirSync(output, { recursive: true });
+        writeFileSync(
+          `${output}/quality-guide-${locale}.html`,
+          `<!doctype html><html lang="${locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>${html}</body></html>`
+        );
+      }
+      cleanup();
+    }
+  } finally {
+    cleanup();
+    setLocale('en');
+  }
+  expect(
+    JSON.stringify({
+      execution: campaign.execution,
+      orders: campaign.orders,
+      qc: useQCLabStore.getState().qcLab,
+      material: useMaterialFlowStore.getState().getMaterialBalance(),
+    })
+  ).toBe(before);
+  const output = process.env.MILLOS_DELIVERY_EVIDENCE_DIR;
+  if (output)
+    writeFileSync(
+      `${output}/quality-guide-domain.json`,
+      JSON.stringify(
+        {
+          scope:
+            'Isolated actual unified-tick stores and FirstDeliveryJourney DOM; no browser/device or human acceptance',
+          certification: useQCLabStore.getState().qcLab.certificationStatus,
+          execution: campaign.execution,
+          batchDispositions: useMaterialFlowStore
+            .getState()
+            .productionBatches.map((batch) => batch.disposition),
+          balance: useMaterialFlowStore.getState().getMaterialBalance(),
+          evidence,
+        },
+        null,
+        2
+      )
+    );
+
+  useQCLabStore.getState().updateCertificationStatus('valid');
+  for (let i = 30; i < morningWindowTicks; i++) step();
+
+  expect(useOperationsCampaignStore.getState().orders[0].status).toBe('fulfilled');
+});
+
+it.each(['power_recovery', 'packaging_recovery', 'network_recovery'] as OperationsChallengeId[])(
+  'allows timely recovery of %s at the actual default pace',
+  (challengeId) => {
+    step();
+    expect(useOperationsCampaignStore.getState().startChallenge(challengeId)).toBe(true);
+    const run = useOperationsCampaignStore.getState().activeChallenge!;
+    step();
+    expect(
+      useOperationsCampaignStore.getState().incidents.find((i) => i.id === run.incidentId)
+        ?.effectApplied
+    ).toBe(true);
+    // Give the player ten real seconds to notice the event before responding.
+    for (let i = 0; i < Math.ceil(10 / deltaSeconds); i++) step();
+    useOperationsCampaignStore.getState().acknowledgeIncident(run.incidentId);
+    useOperationsCampaignStore.getState().mitigateIncident(run.incidentId);
+    expect(useOperationsCampaignStore.getState().finishChallengeRecovery()).toBe(true);
+    for (let i = 0; i < 400 && useOperationsCampaignStore.getState().activeChallenge; i++) step();
+
+    expect(useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status).toBe('completed');
+  }
+);
+
+// Longer source journeys cover changeover and replay, including mixed old/new
+// work in progress. Physical truck travel and interactive maintenance remain
+// separate browser acceptance questions.
+function completeProgramme() {
+  for (
+    let i = 0;
+    // 7.5 game hours at standard pace: a programme's longest window is 7 h.
+    i < 1800 && useOperationsCampaignStore.getState().orders.some((o) => o.status !== 'fulfilled');
+    i++
+  )
+    step();
+  expect(useOperationsCampaignStore.getState().orders.every((o) => o.status === 'fulfilled')).toBe(
+    true
+  );
+  expect(useOperationsCampaignStore.getState().orders.every((o) => o.qualityFailureKg === 0)).toBe(
+    true
+  );
+}
+
+it.each([STANDARD_GAME_SPEED, 120])(
+  'completes all real recipes and replays without resetting physical stock at %ix',
+  (speed) => {
+    useGameSimulationStore.getState().setGameSpeed(speed);
+    completeProgramme();
+    expect(useMaterialFlowStore.getState().shippedKg).toBeCloseTo(18000, 6);
+    const physicalBefore = useMaterialFlowStore.getState().shippedKg;
+    const sessionBefore = useMaterialFlowStore.getState().sessionId;
+    expect(useOperationsCampaignStore.getState().acceptNextProgramme()).toBe(true);
+    const programmeKg = useOperationsCampaignStore
+      .getState()
+      .orders.slice(-3)
+      .reduce((sum, order) => sum + order.requiredKg, 0);
+    expect(useMaterialFlowStore.getState().sessionId).toBe(sessionBefore);
+    expect(useMaterialFlowStore.getState().shippedKg).toBe(physicalBefore);
+    completeProgramme();
+    expect(useMaterialFlowStore.getState().shippedKg - physicalBefore).toBeCloseTo(programmeKg, 6);
+    expect(useMaterialFlowStore.getState().sessionId).toBe(sessionBefore);
+    expect(useOperationsCampaignStore.getState().reports.length).toBeGreaterThan(0);
+  }
+);
+
+it('improves worn-machine quality through real preventive service and parts consumption', () => {
+  // Wear runs on game time, so operate whole programmes until a unit has worn.
+  // R.M. 101 starts part-worn (wear 46, efficiency 89), so after the guided
+  // programme it is already the worn unit and the loop adds none.
+  // Product quality reads the running mills, sifters and packers; a silo
+  // (Silo Alpha starts part-worn) stores grain and does not change it.
+  const wornOnProductPath = (m: MachineData) =>
+    m.type !== MachineType.SILO && m.metrics.efficiency < 100;
+  completeProgramme();
+  for (
+    let programme = 0;
+    programme < 8 && !useProductionStore.getState().machines.some(wornOnProductPath);
+    programme++
+  ) {
+    expect(useOperationsCampaignStore.getState().acceptNextProgramme()).toBe(true);
+    completeProgramme();
+  }
+  const production = useProductionStore.getState();
+  const qualityBefore = production.metrics.quality;
+  const materialBefore = useMaterialFlowStore.getState().getMaterialBalance();
+  const partsBefore = { ...useBreakdownStore.getState().partsInventory };
+  const worn = production.machines.filter(wornOnProductPath);
+  expect(worn.length).toBeGreaterThan(0);
+  for (const machine of worn) {
+    const parts = useBreakdownStore.getState();
+    expect(parts.getBreakdownForMachine(machine.id)).toBeUndefined();
+    const part =
+      machine.type === MachineType.ROLLER_MILL
+        ? 'bearings'
+        : machine.type === MachineType.PLANSIFTER
+          ? 'filters'
+          : 'belts';
+    parts.scheduleMaintenanceTask({
+      machineId: machine.id,
+      machineName: machine.name,
+      scheduledTime: useGameSimulationStore.getState().gameTime,
+      type: 'preventive',
+      priority: 'medium',
+      partsNeeded: [part],
+    });
+    const task = useBreakdownStore
+      .getState()
+      .maintenanceSchedule.find((t) => t.machineId === machine.id && !t.completed)!;
+    // The service runs first; its parts are consumed only once it is done.
+    expect(production.performMaintenance(machine.id).success).toBe(true);
+    expect(parts.completeMaintenanceTask(task.id)).toBe(true);
+    expect(
+      useBreakdownStore.getState().maintenanceSchedule.find((t) => t.id === task.id)?.completed
+    ).toBe(true);
+  }
+  const partsAfter = useBreakdownStore.getState().partsInventory;
+  expect(
+    Object.values(partsBefore).reduce((a, b) => a + b, 0) -
+      Object.values(partsAfter).reduce((a, b) => a + b, 0)
+  ).toBe(worn.length);
+  // Servicing changes machines and consumes parts, never the material ledger.
+  expect(useMaterialFlowStore.getState().getMaterialBalance()).toEqual(materialBefore);
+  step();
+  expect(useProductionStore.getState().metrics.quality).toBeGreaterThan(qualityBefore);
+  expect(useOperationsCampaignStore.getState().orders.every((o) => o.qualityFailureKg === 0)).toBe(
+    true
+  );
+});
+
+// Execute the actual dock's lifecycle predicates too. Unlike step(), this lane
+// waits for the real fixed-step approach, safety service and departure phases.
+const truckBayFile = ts.createSourceFile(
+  'TruckBay.tsx',
+  readFileSync('src/components/TruckBay.tsx', 'utf8'),
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX
+);
+const predicateNames = ['isTruckPhysicallyDocked', 'isTruckTransferReady', 'getTruckLifecycle'];
+const predicates: string[] = [];
+function findTruckPredicates(node: ts.Node) {
+  if (ts.isVariableDeclaration(node) && predicateNames.includes(node.name.getText(truckBayFile)))
+    predicates.push(`const ${node.getText(truckBayFile)};`);
+  ts.forEachChild(node, findTruckPredicates);
+}
+findTruckPredicates(truckBayFile);
+expect(predicates).toHaveLength(predicateNames.length);
+const dockPredicates = new Function(
+  ts.transpileModule(predicates.join('\n'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText + `;return {${predicateNames.join(',')}};`
+)() as {
+  isTruckPhysicallyDocked: (pose: TruckAnimState) => boolean;
+  isTruckTransferReady: (pose: TruckAnimState) => boolean;
+  getTruckLifecycle: (pose: TruckAnimState) => TruckLifecyclePhase;
+};
+
+// One time model: the pace scales the clock, material, loading and the yard
+// together, so the same programme lands on the same game minutes at every pace.
+// Trucks advance exactly as TruckBay does: render frames converted to plant
+// time by advanceTruckClock, run in the controller's fixed steps.
+// The yard keeps its trucks between calls, so later programmes meet the
+// trucks exactly where the earlier ones left them (one docked and waiting).
+function realTruckYard(pace: number) {
+  const controllers: Record<'shipping' | 'receiving', TruckControllerState> = {
+    shipping: createTruckController('shipping'),
+    receiving: createTruckController('receiving'),
+  };
+  const accumulators = { shipping: 0, receiving: 0 };
+  const renderFrame = 1 / 60;
+  const framesPerTick = Math.round(deltaSeconds / renderFrame);
+  useGameSimulationStore.getState().setGameSpeed(pace);
+  return function run(gameMinutes: number, done: () => boolean, onTick?: () => void) {
+    const maxTicks = Math.ceil((gameMinutes * 60) / (pace * deltaSeconds));
+    for (let tick = 0; tick < maxTicks && !done(); tick++) {
+      for (let frame = 0; frame < framesPerTick; frame++) {
+        for (const dock of ['receiving', 'shipping'] as const) {
+          const clock = advanceTruckClock(
+            accumulators[dock],
+            renderFrame,
+            pace,
+            controllers[dock].motion.speed
+          );
+          accumulators[dock] = clock.accumulator;
+          for (let step = 0; step < clock.steps; step++) {
+            const trucks = useTruckScheduleStore.getState();
+            const campaign = useOperationsCampaignStore.getState();
+            const result = stepTruckController(controllers[dock], {
+              deltaSeconds: TRUCK_CONTROLLER_STEP_SECONDS,
+              arrivalReady: trucks.truckSchedule[dock].arrivalReady,
+              safetyHold: false,
+              serviceComplete:
+                dock === 'receiving' || campaign.execution.dispatchLoad.status === 'ready',
+              speedMultiplier: campaign.getIncidentEffect().vehicleSpeedMultiplier,
+            });
+            controllers[dock] = result.state;
+            if (trucks.truckSchedule[dock].arrivalReady && result.state.active)
+              trucks.consumeTruckArrival(dock);
+            if (result.departedThisStep)
+              trucks.recordTruckDeparture(
+                dock,
+                toSimulationMinutes({
+                  day: useGameSimulationStore.getState().gameDay,
+                  hour: useGameSimulationStore.getState().gameTime,
+                })
+              );
+            if (
+              trucks.truckSchedule[dock].truckDocked !==
+              dockPredicates.isTruckPhysicallyDocked(result.pose)
+            )
+              trucks.setTruckDocked(dock, dockPredicates.isTruckPhysicallyDocked(result.pose));
+            if (
+              useTruckScheduleStore.getState().truckSchedule[dock].transferReady !==
+              dockPredicates.isTruckTransferReady(result.pose)
+            )
+              trucks.setTruckTransferReady(dock, dockPredicates.isTruckTransferReady(result.pose));
+            if (
+              useTruckScheduleStore.getState().truckSchedule[dock].lifecyclePhase !==
+              dockPredicates.getTruckLifecycle(result.pose)
+            )
+              trucks.setTruckLifecycle(dock, dockPredicates.getTruckLifecycle(result.pose));
+          }
+        }
+      }
+      unifiedGameTick({
+        deltaSeconds,
+        gameSpeed: pace,
+        gameTime: useGameSimulationStore.getState().gameTime,
+        elapsedTime: tickCount * deltaSeconds,
+        tickCount: ++tickCount,
+      });
+      onTick?.();
+      expect(
+        useMaterialFlowStore.getState().manifests.filter((m) => m.kind === 'shipping').length
+      ).toBeLessThanOrEqual(useTruckScheduleStore.getState().truckSchedule.shipping.departureCount);
+    }
+  };
+}
+
+function runGuidedProgrammeWithRealTrucks(pace: number, onTick?: () => void) {
+  const run = realTruckYard(pace);
+  run(
+    1920 * deltaSeconds * (STANDARD_GAME_SPEED / 60),
+    () => useOperationsCampaignStore.getState().orders.every((o) => o.status === 'fulfilled'),
+    onTick
+  );
+  const orders = useOperationsCampaignStore.getState().orders;
+  expect(orders).toHaveLength(3);
+  expect(orders.every((o) => o.status === 'fulfilled')).toBe(true);
+  expect(orders.every((o) => o.completedAtMinute! <= o.dueAtMinute)).toBe(true);
+  expect(orders.every((o) => o.manifestIds.length > 0 && o.qualityFailureKg === 0)).toBe(true);
+  expect(useMaterialFlowStore.getState().shippedKg).toBeCloseTo(18000, 6);
+  return orders.map((o) => o.completedAtMinute!);
+}
+
+const STANDARD_COMPLETION: number[] = [];
+it.each([
+  STANDARD_GAME_SPEED,
+  ...PACE_GAME_SPEEDS.filter((pace) => pace > 0 && pace !== STANDARD_GAME_SPEED),
+])(
+  'completes the guided programme through real truck travel on time at pace %i, on the same game minutes',
+  (pace) => {
+    const completed = runGuidedProgrammeWithRealTrucks(pace);
+    if (pace === STANDARD_GAME_SPEED) STANDARD_COMPLETION.splice(0, 3, ...completed);
+    if (STANDARD_COMPLETION.length === 3)
+      // One 0.5 s tick at 4x is a game minute; the yard and loading quantise
+      // to the tick, so allow a few minutes, never a deadline's worth.
+      completed.forEach((minute, i) =>
+        expect(Math.abs(minute - STANDARD_COMPLETION[i])).toBeLessThanOrEqual(6)
+      );
+  }
+);
+
+// The idle line: once an order's remainder is packed and waiting for its truck,
+// the line starts the next commitment instead of reading '0 bags/h' until the
+// truck leaves. Working if the first order still ships only its own flour, on
+// time, and the semolina is already being made when it is fulfilled.
+it('pre-stages the next commitment while the first order waits for its second truck', () => {
+  let idleTicksWithOpenWork = 0;
+  let semolinaAtFirstFulfilment: number | null = null;
+  runGuidedProgrammeWithRealTrucks(STANDARD_GAME_SPEED, () => {
+    const campaign = useOperationsCampaignStore.getState();
+    const flow = useMaterialFlowStore.getState();
+    // Unpacked work exists when open commitments need more of a product than
+    // is already packed: only then is an idle line dead time.
+    const unpackedKg = (['flour', 'semolina'] as const).reduce((sum, material) => {
+      const owed = campaign.orders
+        .filter((o) => o.status !== 'fulfilled' && o.recipe.finishedMaterial === material)
+        .reduce((n, o) => n + Math.max(0, o.requiredKg - o.shippedKg), 0);
+      const packed = flow.productionBatches
+        .filter((b) => b.materialType === material)
+        .reduce((n, b) => n + b.availableKg, 0);
+      return sum + Math.max(0, owed - packed);
+    }, 0);
+    if (unpackedKg > 1000 && flow.currentPackerFlowRate === 0) idleTicksWithOpenWork++;
+    if (semolinaAtFirstFulfilment === null && campaign.orders[0].status === 'fulfilled')
+      semolinaAtFirstFulfilment = flow.productionBatches
+        .filter((b) => b.materialType === 'semolina')
+        .reduce((sum, b) => sum + b.producedKg, 0);
+  });
+  expect(semolinaAtFirstFulfilment).toBeGreaterThan(1000);
+  // Only the start and each recipe changeover fill the line before packing:
+  // 63 ticks here, against 425 (about 212 game minutes) without pre-staging.
+  expect(idleTicksWithOpenWork).toBeLessThan(80);
+  const manifests = useMaterialFlowStore.getState().manifests.filter((m) => m.kind === 'shipping');
+  const firstOrder = useOperationsCampaignStore.getState().orders[0];
+  expect(firstOrder.shippedKg).toBeCloseTo(6000, 6);
+  expect(manifests.length).toBeGreaterThan(0);
+});
+
+// Later programmes (src/simulation/programmes.ts) through the same yard the
+// guided programme used, so each meets the trucks where the last one left
+// them. Working if programmes 2 to 4 and a night programme each ship every
+// order on time with at least 20 game minutes to spare at standard pace.
+it('delivers programmes 2 to 4 and a night programme on time through real truck travel', () => {
+  const run = realTruckYard(STANDARD_GAME_SPEED);
+  const programmeDone = () =>
+    useOperationsCampaignStore
+      .getState()
+      .orders.slice(-3)
+      .every((o) => o.status === 'fulfilled');
+  run(600, programmeDone);
+  expect(useOperationsCampaignStore.getState().orders.every((o) => o.status === 'fulfilled')).toBe(
+    true
+  );
+  const delivered: Array<{ shift: string; kg: number[]; slack: number[] }> = [];
+  const deliverNext = () => {
+    const shift = useGameSimulationStore.getState().currentShift;
+    expect(useOperationsCampaignStore.getState().acceptNextProgramme()).toBe(true);
+    // The longest window is the night bulk order's 9 h; allow an hour more.
+    run(600, programmeDone);
+    const orders = useOperationsCampaignStore.getState().orders.slice(-3);
+    expect(orders.map((o) => o.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled']);
+    expect(orders.every((o) => o.qualityFailureKg === 0)).toBe(true);
+    delivered.push({
+      shift,
+      kg: orders.map((o) => o.requiredKg),
+      slack: orders.map((o) => o.dueAtMinute - o.completedAtMinute!),
+    });
+  };
+  for (let n = 2; n <= 4; n++) deliverNext();
+  if (!delivered.some((p) => p.shift === 'night')) {
+    run(24 * 60, () => useGameSimulationStore.getState().currentShift === 'night');
+    deliverNext();
+  }
+  const night = delivered.find((p) => p.shift === 'night');
+  expect(night?.kg).toEqual([2500, 3000, 8000]);
+  for (const programme of delivered)
+    for (const slack of programme.slack) expect(slack).toBeGreaterThanOrEqual(20);
+});
+
+// The rush's one choice, through the same real yard at standard pace. Shipped
+// product is credited to the rush first, so only a commitment for ANOTHER
+// product can hold it back; that one makes it wait for a later truck. Working
+// if the rush run first leaves on the first truck with 20 game minutes to
+// spare, and deferring it behind another product makes it at least 20 game
+// minutes late - a risk the card can state, not a rounding error.
+it.each([
+  // Programme 2: semolina rush; the 3,000 kg flour order first.
+  { programme: 2, deferTo: 1, deferred: true },
+  // Programme 3: flour rush; the night-or-day bulk order is semolina.
+  { programme: 3, deferTo: 2, deferred: true },
+  // Programme 3: the 3,000 kg order is flour too, so the rush still ships first.
+  { programme: 3, deferTo: 1, deferred: false },
+])(
+  'times the rush by the truck it leaves on: programme $programme, order $deferTo first',
+  ({ programme, deferTo, deferred }) => {
+    const run = realTruckYard(STANDARD_GAME_SPEED);
+    const programmeDone = () =>
+      useOperationsCampaignStore
+        .getState()
+        .orders.slice(-3)
+        .every((o) => o.status === 'fulfilled');
+    run(600, programmeDone);
+    const rushOutcome = (deferToIndex: number | null) => {
+      expect(useOperationsCampaignStore.getState().acceptNextProgramme()).toBe(true);
+      const accepted = useOperationsCampaignStore.getState().orders.slice(-3);
+      if (deferToIndex !== null)
+        useOperationsCampaignStore.getState().activateOrder(accepted[deferToIndex].id, 'operator');
+      run(600, programmeDone);
+      const rush = useOperationsCampaignStore.getState().orders.slice(-3)[0];
+      expect(rush.rushPremiumPercent).toBeGreaterThan(0);
+      return rush.dueAtMinute - rush.completedAtMinute!;
+    };
+    // Earlier programmes run as the controller plans them.
+    for (let n = 2; n < programme; n++) rushOutcome(null);
+    const slack = rushOutcome(deferTo);
+    if (deferred) expect(slack).toBeLessThanOrEqual(-20);
+    else expect(slack).toBeGreaterThanOrEqual(20);
+  }
+);
+
+it('ships the rush on time when it runs first, in every programme 2 to 4', () => {
+  const run = realTruckYard(STANDARD_GAME_SPEED);
+  const programmeDone = () =>
+    useOperationsCampaignStore
+      .getState()
+      .orders.slice(-3)
+      .every((o) => o.status === 'fulfilled');
+  run(600, programmeDone);
+  for (let n = 2; n <= 4; n++) {
+    expect(useOperationsCampaignStore.getState().acceptNextProgramme()).toBe(true);
+    run(600, programmeDone);
+    const rush = useOperationsCampaignStore.getState().orders.slice(-3)[0];
+    expect(rush.dueAtMinute - rush.completedAtMinute!).toBeGreaterThanOrEqual(20);
+  }
+});

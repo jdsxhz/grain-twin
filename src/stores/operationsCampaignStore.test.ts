@@ -1,0 +1,972 @@
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  MAX_MATERIAL_MANIFESTS,
+  type MaterialManifest,
+  type ProductionBatch,
+} from './materialFlowStore';
+import { useOperationsCampaignStore, type CampaignTickContext } from './operationsCampaignStore';
+
+const flourBatch: ProductionBatch = {
+  id: 'batch-0001',
+  packerId: 'packer-0',
+  materialType: 'flour',
+  producedKg: 5000,
+  availableKg: 0,
+  simulationTime: 10,
+  sourceContributions: [{ lotId: 'lot-0001', amount: 5000, path: ['silo-0', 'packer-0'] }],
+  disposition: 'shipped',
+  dispositionReason: 'Fully dispatched',
+  qcTestIds: ['qc-1'],
+  dispatchManifestIds: ['shipping-0001'],
+  sealed: true,
+};
+
+const shippingManifest: MaterialManifest = {
+  id: 'shipping-0001',
+  kind: 'shipping',
+  dock: 'shipping',
+  requestedKg: 5000,
+  actualKg: 5000,
+  materials: [{ type: 'flour', amount: 5000 }],
+  sourceLots: [{ lotId: 'lot-0001', amount: 5000, path: ['silo-0', 'packer-0'] }],
+  productBatches: [{ batchId: 'batch-0001', amount: 5000 }],
+  simulationTime: 20,
+};
+
+function context(overrides: Partial<CampaignTickContext> = {}): CampaignTickContext {
+  return {
+    shiftKey: 'day-1-morning',
+    shiftLabel: 'Morning',
+    manifests: [],
+    productionBatches: [],
+    totalEnergyKw: 450,
+    averageQuality: 99,
+    wasteKg: 0,
+    storageUtilization: 0.5,
+    shippingDocked: false,
+    receivingDocked: false,
+    dispatchReleased: true,
+    sourceInventoryKg: 50000,
+    finishedAvailableKg: 0,
+    releasedFinishedKg: 0,
+    dispatchLoad: {
+      cycleId: 'shipping-0',
+      status: 'away',
+      loadedKg: 0,
+      capacityKg: 5000,
+      materialType: 'flour',
+      blockReason: null,
+      lastDispatchKg: 0,
+    },
+    openWorkOrders: 0,
+    ...overrides,
+  };
+}
+
+describe('autonomous operations programme', () => {
+  beforeEach(() => useOperationsCampaignStore.getState().resetCampaign());
+
+  it('initializes from equipment and inventory state without a roster', () => {
+    useOperationsCampaignStore.getState().initializeCampaign();
+    const state = useOperationsCampaignStore.getState();
+    expect(state.initialized).toBe(true);
+    expect(state.logbook.at(-1)).toMatchObject({ source: 'Autonomous execution' });
+  });
+
+  it('turns the selected recipe into the active physical production plan', () => {
+    useOperationsCampaignStore.getState().activateOrder('order-002');
+    expect(useOperationsCampaignStore.getState().getActiveProductionPlan()).toMatchObject({
+      orderId: 'order-002',
+      sourceMaterial: 'corn_grain',
+      finishedMaterial: 'semolina',
+    });
+  });
+
+  it('publishes process, quality, and truck loading as one execution state', () => {
+    useOperationsCampaignStore.getState().tickCampaign(
+      60,
+      context({
+        sourceInventoryKg: 42000,
+        finishedAvailableKg: 1600,
+        releasedFinishedKg: 1200,
+        dispatchLoad: {
+          cycleId: 'shipping-1',
+          status: 'loading',
+          loadedKg: 800,
+          capacityKg: 5000,
+          materialType: 'flour',
+          blockReason: null,
+          lastDispatchKg: 0,
+        },
+      })
+    );
+    expect(useOperationsCampaignStore.getState().execution).toMatchObject({
+      orderId: 'order-001',
+      sourceMaterial: 'wheat_grain',
+      finishedMaterial: 'flour',
+      stage: 'loading',
+      sourceInventoryKg: 42000,
+      releasedFinishedKg: 1200,
+      dispatchLoad: { loadedKg: 800 },
+    });
+  });
+
+  it('raises a critical recipe constraint when feedstock is exhausted', () => {
+    useOperationsCampaignStore.getState().activateOrder('order-002');
+    useOperationsCampaignStore.getState().tickCampaign(60, context({ sourceInventoryKg: 0 }));
+    expect(useOperationsCampaignStore.getState().constraints).toContainEqual(
+      expect.objectContaining({
+        id: 'recipe-feed-order-002',
+        severity: 'critical',
+        relatedId: 'order-002',
+      })
+    );
+  });
+
+  it('distinguishes an empty shipping supply from an actual quality hold', () => {
+    const store = useOperationsCampaignStore.getState();
+    const dispatchLoad = {
+      ...context().dispatchLoad,
+      status: 'held' as const,
+      blockReason: 'Waiting for released flour at the packers.',
+    };
+    store.tickCampaign(60, context({ dispatchLoad }));
+    expect(useOperationsCampaignStore.getState().execution).toMatchObject({
+      stage: 'milling',
+      qualityReleased: true,
+    });
+    expect(store.startChallenge('power_recovery')).toBe(true);
+    store.resetCampaign();
+    store.tickCampaign(60, context({ dispatchLoad, dispatchReleased: false }));
+    expect(useOperationsCampaignStore.getState().execution.stage).toBe('quality_hold');
+    expect(store.startChallenge('power_recovery')).toBe(false);
+  });
+
+  it('keeps incident dispatch isolation authoritative when QC is otherwise released', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.triggerIncident('supplier_contamination');
+    store.tickCampaign(
+      60,
+      context({
+        dispatchReleased: true,
+        dispatchLoad: {
+          ...context().dispatchLoad,
+          status: 'held',
+          blockReason: 'An active operational incident requires dispatch isolation.',
+        },
+      })
+    );
+    expect(useOperationsCampaignStore.getState().execution).toMatchObject({
+      stage: 'quality_hold',
+      qualityReleased: false,
+    });
+  });
+
+  it('keeps every visible utility vessel reading finite and bounded', () => {
+    useOperationsCampaignStore.getState().tickCampaign(300, context());
+    const assets = useOperationsCampaignStore.getState().utilityAssets;
+    expect(assets).toHaveLength(5);
+    for (const asset of assets) {
+      expect(Number.isFinite(asset.levelPercent)).toBe(true);
+      expect(Number.isFinite(asset.temperatureC)).toBe(true);
+      expect(Number.isFinite(asset.pressureBar)).toBe(true);
+      expect(asset.levelPercent).toBeGreaterThanOrEqual(0);
+      expect(asset.levelPercent).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it('allocates each shipping manifest exactly once', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(
+      60,
+      context({ manifests: [shippingManifest], productionBatches: [flourBatch] })
+    );
+    store.tickCampaign(
+      60,
+      context({ manifests: [shippingManifest], productionBatches: [flourBatch] })
+    );
+    const order = useOperationsCampaignStore
+      .getState()
+      .orders.find((candidate) => candidate.id === 'order-001')!;
+    expect(order.shippedKg).toBe(5000);
+    expect(order.manifestIds).toEqual(['shipping-0001']);
+    expect(useOperationsCampaignStore.getState().economics.revenue).toBeCloseTo(4100, 5);
+  });
+
+  it('applies, mitigates, and resolves incident effects explicitly', () => {
+    const store = useOperationsCampaignStore.getState();
+    const incident = store.triggerIncident('supplier_contamination')!;
+    expect(store.getIncidentEffect().dispatchBlocked).toBe(true);
+    store.mitigateIncident(incident.id);
+    expect(useOperationsCampaignStore.getState().getIncidentEffect().dispatchBlocked).toBe(false);
+    store.resolveIncident(incident.id);
+    expect(useOperationsCampaignStore.getState().getIncidentEffect().productionMultiplier).toBe(1);
+  });
+
+  it('slows yard vehicles during severe rain and restores them through mitigation', () => {
+    const store = useOperationsCampaignStore.getState();
+    const incident = store.triggerIncident('severe_rain')!;
+    expect(store.getIncidentEffect().vehicleSpeedMultiplier).toBeCloseTo(0.55);
+    store.mitigateIncident(incident.id);
+    expect(
+      useOperationsCampaignStore.getState().getIncidentEffect().vehicleSpeedMultiplier
+    ).toBeCloseTo(0.775);
+    store.resolveIncident(incident.id);
+    expect(useOperationsCampaignStore.getState().getIncidentEffect().vehicleSpeedMultiplier).toBe(
+      1
+    );
+  });
+
+  it('closes a causal report when the simulation crosses a production period boundary', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(
+      60,
+      context({ manifests: [shippingManifest], productionBatches: [flourBatch] })
+    );
+    useOperationsCampaignStore
+      .getState()
+      .tickCampaign(60, context({ shiftKey: 'day-1-afternoon', shiftLabel: 'Afternoon' }));
+    const report = useOperationsCampaignStore.getState().reports.at(-1)!;
+    expect(report.shiftKey).toBe('day-1-morning');
+    expect(report.metrics.dispatchedKg).toBe(5000);
+    expect(report.metrics.revenue).toBeCloseTo(4100, 5);
+  });
+
+  it('offers a next programme once every commitment is fulfilled', () => {
+    const semolinaBatch: ProductionBatch = {
+      ...flourBatch,
+      id: 'batch-0002',
+      materialType: 'semolina',
+      producedKg: 4000,
+      sourceContributions: [{ lotId: 'lot-0001', amount: 4000, path: ['silo-0', 'packer-0'] }],
+    };
+    const manifest: MaterialManifest = {
+      ...shippingManifest,
+      sourceLots: [{ lotId: 'lot-0001', amount: 18000, path: ['silo-0', 'packer-0'] }],
+      requestedKg: 18000,
+      actualKg: 18000,
+      materials: [
+        { type: 'flour', amount: 14000 },
+        { type: 'semolina', amount: 4000 },
+      ],
+      productBatches: [
+        { batchId: 'batch-0001', amount: 14000 },
+        { batchId: 'batch-0002', amount: 4000 },
+      ],
+    };
+    useOperationsCampaignStore.getState().tickCampaign(
+      60,
+      context({
+        manifests: [manifest],
+        productionBatches: [{ ...flourBatch, producedKg: 14000 }, semolinaBatch],
+      })
+    );
+
+    const state = useOperationsCampaignStore.getState();
+    expect(state.orders.every((order) => order.status === 'fulfilled')).toBe(true);
+    expect(state.activeOrderId).toBeNull();
+    expect(state.execution.lineSetpointPercent).toBe(70);
+    expect(state.getProductionMultiplier()).toBeCloseTo(0.7, 5);
+    expect(state.logbook.at(-1)?.message).toBe(
+      'All commitments fulfilled. Accept the next production programme or review the completed period.'
+    );
+    expect(state.acceptNextProgramme()).toBe(true);
+    expect(useOperationsCampaignStore.getState().orders).toHaveLength(6);
+    // A varied programme (src/simulation/programmes.ts), not three equal clones.
+    expect(
+      useOperationsCampaignStore
+        .getState()
+        .orders.slice(-3)
+        .map((order) => [order.requiredKg, order.shippedKg])
+    ).toEqual([
+      [2500, 0],
+      [3000, 0],
+      [6000, 0],
+    ]);
+    expect(useOperationsCampaignStore.getState().acceptNextProgramme()).toBe(false);
+  });
+
+  // The pt-BR play-test on 9115ad52 appeared to orphan an order at 5,000 of
+  // 6,000 kg when the next programme arrived. The store refuses a programme
+  // while any order is open, keeps the line on that order, ships the 1,000 kg
+  // remainder on the next truck and only then takes the programme. (The
+  // play-test's view was a Level 1 agent read cut to the five oldest orders.)
+  const partShipped = () => {
+    const [first, ...rest] = useOperationsCampaignStore.getState().orders;
+    useOperationsCampaignStore.setState({
+      orders: [
+        { ...first, status: 'active', shippedKg: 5000 },
+        ...rest.map((order) => ({
+          ...order,
+          status: 'fulfilled' as const,
+          shippedKg: order.requiredKg,
+          completedAtMinute: 100,
+        })),
+      ],
+      activeOrderId: first.id,
+    });
+    return first;
+  };
+  const remainderBatch: ProductionBatch = {
+    ...flourBatch,
+    id: 'batch-0002',
+    producedKg: 1000,
+    dispatchManifestIds: ['shipping-0002'],
+  };
+  const remainderManifest: MaterialManifest = {
+    ...shippingManifest,
+    id: 'shipping-0002',
+    requestedKg: 1000,
+    actualKg: 1000,
+    materials: [{ type: 'flour', amount: 1000 }],
+    sourceLots: [{ lotId: 'lot-0001', amount: 1000, path: ['silo-0', 'packer-0'] }],
+    productBatches: [{ batchId: 'batch-0002', amount: 1000 }],
+  };
+
+  it('keeps serving a part-shipped order instead of letting the next programme orphan it', () => {
+    const store = useOperationsCampaignStore.getState();
+    const first = partShipped();
+    expect(store.acceptNextProgramme()).toBe(false);
+    store.tickCampaign(60, context());
+    let state = useOperationsCampaignStore.getState();
+    expect(state.orders).toHaveLength(3);
+    expect(state.activeOrderId).toBe(first.id);
+    expect(state.getLineProductionPlan({})).toMatchObject({ orderId: first.id });
+
+    store.tickCampaign(
+      60,
+      context({ manifests: [remainderManifest], productionBatches: [remainderBatch] })
+    );
+    state = useOperationsCampaignStore.getState();
+    expect(state.orders[0]).toMatchObject({ id: first.id, status: 'fulfilled', shippedKg: 6000 });
+    expect(state.acceptNextProgramme()).toBe(true);
+    state = useOperationsCampaignStore.getState();
+    expect(state.orders[0]).toMatchObject({ id: first.id, status: 'fulfilled' });
+    expect(state.activeOrderId).toMatch(/^programme-/);
+  });
+
+  it('marks a part-shipped order late once its due minute passes and still finishes it', () => {
+    const store = useOperationsCampaignStore.getState();
+    const first = partShipped();
+    store.tickCampaign((first.dueAtMinute + 1) * 60, context());
+    let state = useOperationsCampaignStore.getState();
+    expect(state.orders[0]).toMatchObject({ id: first.id, status: 'late', shippedKg: 5000 });
+    expect(state.activeOrderId).toBe(first.id);
+    expect(state.getLineProductionPlan({})).toMatchObject({ orderId: first.id });
+    expect(state.acceptNextProgramme()).toBe(false);
+
+    store.tickCampaign(
+      60,
+      context({ manifests: [remainderManifest], productionBatches: [remainderBatch] })
+    );
+    state = useOperationsCampaignStore.getState();
+    expect(state.orders[0]).toMatchObject({ status: 'fulfilled', shippedKg: 6000 });
+    expect(state.orders[0].completedAtMinute).toBeGreaterThan(first.dueAtMinute);
+  });
+
+  it('recovers a save whose active order id no longer names an open order', () => {
+    const store = useOperationsCampaignStore.getState();
+    const first = partShipped();
+    useOperationsCampaignStore.setState({ activeOrderId: 'programme-118-order-1' });
+    store.tickCampaign(60, context());
+    const state = useOperationsCampaignStore.getState();
+    expect(state.activeOrderId).toBe(first.id);
+    expect(state.getLineProductionPlan({})).toMatchObject({ orderId: first.id });
+  });
+
+  it('never credits a product batch beyond its own mass', () => {
+    const secondFlourBatch: ProductionBatch = { ...flourBatch, id: 'batch-0002', producedKg: 500 };
+    const manifest: MaterialManifest = {
+      ...shippingManifest,
+      sourceLots: [{ lotId: 'lot-0001', amount: 6500, path: ['silo-0', 'packer-0'] }],
+      requestedKg: 6500,
+      actualKg: 6500,
+      materials: [{ type: 'flour', amount: 6500 }],
+      productBatches: [
+        { batchId: 'batch-0001', amount: 6000 },
+        { batchId: 'batch-0002', amount: 500 },
+      ],
+    };
+    useOperationsCampaignStore
+      .getState()
+      .tickCampaign(
+        60,
+        context({ manifests: [manifest], productionBatches: [flourBatch, secondFlourBatch] })
+      );
+
+    const orders = useOperationsCampaignStore.getState().orders;
+    expect(orders.find((order) => order.id === 'order-001')).toMatchObject({
+      shippedKg: 5500,
+      batchIds: ['batch-0001', 'batch-0002'],
+    });
+    expect(orders.find((order) => order.id === 'order-003')).toMatchObject({
+      shippedKg: 0,
+      batchIds: [],
+    });
+  });
+
+  it('restores bookkeeping only with physical session identity', () => {
+    const options = useOperationsCampaignStore.persist.getOptions();
+    const persisted = options.partialize!(useOperationsCampaignStore.getState()) as Record<
+      string,
+      unknown
+    >;
+    expect(persisted).toHaveProperty('processedManifestIds', []);
+    expect(persisted).toHaveProperty('lastMaterialSessionId', null);
+    expect(persisted).toHaveProperty('lastWasteKg', 0);
+
+    const merged = options.merge!(
+      { elapsedMinutes: 42, processedManifestIds: ['shipping-0002'], lastWasteKg: 900 },
+      useOperationsCampaignStore.getState()
+    );
+    expect(merged).toMatchObject({
+      elapsedMinutes: 42,
+      processedManifestIds: [],
+      lastWasteKg: 0,
+    });
+  });
+
+  it('prices energy on the visible game clock when it is supplied', () => {
+    // 60 campaign minutes is off-peak by elapsed time; 10:00 on the clock is peak.
+    useOperationsCampaignStore
+      .getState()
+      .tickCampaign(3600, context({ totalEnergyKw: 1000, clockMinuteOfDay: 600 }));
+    expect(useOperationsCampaignStore.getState().economics.energyCost).toBeCloseTo(150, 5);
+
+    useOperationsCampaignStore.getState().resetCampaign();
+    useOperationsCampaignStore.getState().tickCampaign(3600, context({ totalEnergyKw: 1000 }));
+    expect(useOperationsCampaignStore.getState().economics.energyCost).toBeCloseTo(80, 5);
+  });
+
+  it('logs incident acknowledgement and mitigation, and ignores unknown ids', () => {
+    const store = useOperationsCampaignStore.getState();
+    const incident = store.triggerIncident('supplier_contamination')!;
+    const before = useOperationsCampaignStore.getState();
+
+    store.mitigateIncident('incident-9999');
+    expect(useOperationsCampaignStore.getState()).toBe(before);
+
+    store.acknowledgeIncident(incident.id);
+    expect(useOperationsCampaignStore.getState().logbook.at(-1)?.message).toBe(
+      `${incident.title} acknowledged.`
+    );
+    store.mitigateIncident(incident.id);
+    const after = useOperationsCampaignStore.getState();
+    expect(after.logbook.at(-1)?.message).toBe(
+      `${incident.title} mitigated; residual effect halved.`
+    );
+    expect(after.shiftMetrics.automaticActions).toBe(1);
+
+    store.mitigateIncident(incident.id);
+    expect(useOperationsCampaignStore.getState().shiftMetrics.automaticActions).toBe(1);
+  });
+
+  it('reports an overdue commitment as overdue, not as zero minutes remaining', () => {
+    useOperationsCampaignStore.getState().tickCampaign(250 * 60, context());
+    expect(useOperationsCampaignStore.getState().constraints).toContainEqual(
+      expect.objectContaining({
+        id: 'order-due-order-001',
+        label: 'Commitment overdue',
+        detail: expect.stringMatching(/ is \d+ simulated minutes overdue\.$/),
+      })
+    );
+  });
+
+  it('bounds controller log entries during a long run', () => {
+    const store = useOperationsCampaignStore.getState();
+    for (let index = 0; index < 220; index += 1) {
+      store.addLogEntry('Test controller', 'operation', `Entry ${index}`);
+    }
+    expect(useOperationsCampaignStore.getState().logbook).toHaveLength(160);
+    expect(useOperationsCampaignStore.getState().logbook[0]?.message).toBe('Entry 60');
+  });
+  it('fails closed on missing batch evidence and duplicate batch references', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(60, context({ manifests: [shippingManifest] }));
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(0);
+    const manifest = {
+      ...shippingManifest,
+      id: 'shipping-0002',
+      actualKg: 10000,
+      sourceLots: [{ lotId: 'lot-0001', amount: 10000, path: ['silo-0', 'packer-0'] }],
+      materials: [{ type: 'flour' as const, amount: 10000 }],
+      productBatches: [
+        { batchId: flourBatch.id, amount: 5000 },
+        { batchId: flourBatch.id, amount: 5000 },
+      ],
+    };
+    store.tickCampaign(
+      60,
+      context({
+        manifests: [manifest],
+        productionBatches: [{ ...flourBatch, dispatchManifestIds: [manifest.id] }],
+      })
+    );
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(5000);
+  });
+
+  it('does not credit the same batch mass across different manifests', () => {
+    const store = useOperationsCampaignStore.getState();
+    const second = { ...shippingManifest, id: 'shipping-0002' };
+    const batch = { ...flourBatch, dispatchManifestIds: [shippingManifest.id, second.id] };
+    store.tickCampaign(60, context({ manifests: [shippingManifest], productionBatches: [batch] }));
+    store.tickCampaign(60, context({ manifests: [second], productionBatches: [batch] }));
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(5000);
+  });
+
+  it('requires live challenge preconditions and explicit applied recovery', () => {
+    const store = useOperationsCampaignStore.getState();
+    expect(store.startChallenge('power_recovery')).toBe(false);
+    store.tickCampaign(60, context());
+    expect(store.startChallenge('power_recovery')).toBe(true);
+    expect(store.startChallenge('network_recovery')).toBe(false);
+    const run = useOperationsCampaignStore.getState().activeChallenge!;
+    expect(store.finishChallengeRecovery()).toBe(false);
+    store.acknowledgeIncident(run.incidentId);
+    store.mitigateIncident(run.incidentId);
+    expect(store.finishChallengeRecovery()).toBe(false);
+    store.markIncidentEffectApplied(run.incidentId);
+    expect(store.finishChallengeRecovery()).toBe(true);
+    expect(useOperationsCampaignStore.getState().activeChallenge).not.toBeNull();
+    store.tickCampaign(
+      60,
+      context({ manifests: [shippingManifest], productionBatches: [flourBatch] })
+    );
+    expect(useOperationsCampaignStore.getState().activeChallenge).toBeNull();
+    expect(useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status).toBe('completed');
+  });
+
+  it('expires and abandons challenges without erasing incident controls', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(60, context());
+    store.startChallenge('network_recovery');
+    store.tickCampaign(361 * 60, context());
+    expect(useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status).toBe('failed');
+    expect(store.getIncidentEffect().productionMultiplier).toBeLessThan(1);
+    expect(store.startChallenge('network_recovery')).toBe(false);
+    store.resetCampaign();
+    store.tickCampaign(60, context());
+    store.startChallenge('packaging_recovery');
+    store.abandonChallenge();
+    expect(useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status).toBe('abandoned');
+    expect(store.getIncidentEffect().productionMultiplier).toBeLessThan(1);
+  });
+
+  it('gives new recovery runs a bounded cold-start window and retains old saved deadlines', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(60, context());
+    store.startChallenge('network_recovery');
+    const run = useOperationsCampaignStore.getState().activeChallenge!;
+    expect(run).toMatchObject({ startedAtMinute: 1, deadlineMinute: 361, targetKg: 1000 });
+    const merge = useOperationsCampaignStore.persist.getOptions().merge!;
+    const legacy = { ...run, deadlineMinute: 121 };
+    expect(
+      merge({ activeChallenge: legacy }, useOperationsCampaignStore.getState()).activeChallenge
+    ).toEqual(legacy);
+    store.tickCampaign(120 * 60, context());
+    expect(useOperationsCampaignStore.getState().activeChallenge).not.toBeNull();
+    store.tickCampaign(240 * 60, context());
+    expect(useOperationsCampaignStore.getState().activeChallenge).toBeNull();
+    expect(useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status).toBe('failed');
+  });
+
+  it('publishes what each failure is costing per game hour, from the same formula it books', () => {
+    const store = useOperationsCampaignStore.getState();
+    const late = { ...store.orders[0], status: 'late' as const, shippedKg: 1000 };
+    useOperationsCampaignStore.setState({ orders: [late, ...store.orders.slice(1)] });
+    const before = useOperationsCampaignStore.getState().economics;
+    store.tickCampaign(
+      3600,
+      context({ openWorkOrders: 2, shippingDocked: true, dispatchReleased: false })
+    );
+    const after = useOperationsCampaignStore.getState();
+    const lateRate = (late.requiredKg - late.shippedKg) * late.latePenaltyPerKgHour;
+    expect(after.costRates).toEqual({ maintenance: 180, demurrage: 120, late: lateRate });
+    expect(after.economics.maintenanceCost - before.maintenanceCost).toBeCloseTo(180, 6);
+    expect(after.economics.demurrageCost - before.demurrageCost).toBeCloseTo(120, 6);
+    expect(after.economics.latePenalties - before.latePenalties).toBeCloseTo(lateRate, 6);
+    // An unchanged rate keeps its reference, so the card does not re-render each tick.
+    const rates = after.costRates;
+    store.tickCampaign(
+      1,
+      context({ openWorkOrders: 2, shippingDocked: true, dispatchReleased: false })
+    );
+    expect(useOperationsCampaignStore.getState().costRates).toBe(rates);
+    store.tickCampaign(1, context());
+    expect(useOperationsCampaignStore.getState().costRates).toMatchObject({
+      maintenance: 0,
+      demurrage: 0,
+    });
+  });
+
+  it('judges a shipped batch by the quality it was made at, not the plant reading at dispatch', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(
+      60,
+      context({
+        manifests: [shippingManifest],
+        productionBatches: [{ ...flourBatch, qualityScore: 99 }],
+        averageQuality: 90,
+      })
+    );
+    expect(useOperationsCampaignStore.getState().orders[0].qualityFailureKg).toBe(0);
+
+    store.resetCampaign();
+    store.tickCampaign(
+      60,
+      context({
+        manifests: [shippingManifest],
+        productionBatches: [{ ...flourBatch, qualityScore: 93 }],
+        averageQuality: 99,
+      })
+    );
+    expect(useOperationsCampaignStore.getState().orders[0].qualityFailureKg).toBeGreaterThan(0);
+  });
+
+  it('caps period grading for unsafe recovery and quality failures with causal reasons', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.triggerIncident('bearing_overheat');
+    store.tickCampaign(
+      60,
+      context({ manifests: [shippingManifest], productionBatches: [flourBatch] })
+    );
+    store.tickCampaign(60, context({ shiftKey: 'afternoon' }));
+    expect(useOperationsCampaignStore.getState().reports.at(-1)).toMatchObject({
+      grade: 'D',
+      gradeReasons: expect.arrayContaining([expect.stringContaining('cap the grade at D')]),
+      decisions: expect.any(Array),
+    });
+    store.resetCampaign();
+    store.tickCampaign(
+      60,
+      context({
+        manifests: [shippingManifest],
+        productionBatches: [flourBatch],
+        averageQuality: 90,
+      })
+    );
+    store.tickCampaign(60, context({ shiftKey: 'afternoon' }));
+    expect(useOperationsCampaignStore.getState().reports.at(-1)).toMatchObject({
+      grade: 'F',
+      gradeReasons: expect.arrayContaining([expect.stringContaining('caps the grade at F')]),
+    });
+  });
+  it('preserves batch mass credit across save reload and fresh manifests', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(
+      60,
+      context({ manifests: [shippingManifest], productionBatches: [flourBatch] })
+    );
+    const options = useOperationsCampaignStore.persist.getOptions();
+    const saved = options.partialize!(useOperationsCampaignStore.getState());
+    store.resetCampaign();
+    useOperationsCampaignStore.setState(
+      options.merge!(saved, useOperationsCampaignStore.getState())
+    );
+    store.tickCampaign(60, context());
+    const next = { ...shippingManifest, id: 'shipping-reload' };
+    store.tickCampaign(
+      60,
+      context({
+        manifests: [next],
+        productionBatches: [{ ...flourBatch, dispatchManifestIds: [shippingManifest.id, next.id] }],
+      })
+    );
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(5000);
+  });
+
+  it.each(['abandon', 'expire'])(
+    'allows real controller recovery after challenge %s without changing its result',
+    (mode) => {
+      const store = useOperationsCampaignStore.getState();
+      store.tickCampaign(60, context());
+      store.startChallenge('network_recovery');
+      const incidentId = useOperationsCampaignStore.getState().activeChallenge!.incidentId;
+      if (mode === 'abandon') store.abandonChallenge();
+      else store.tickCampaign(361 * 60, context());
+      const result = useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status;
+      store.acknowledgeIncident(incidentId);
+      store.mitigateIncident(incidentId);
+      store.markIncidentEffectApplied(incidentId);
+      expect(store.finishChallengeRecovery()).toBe(true);
+      expect(useOperationsCampaignStore.getState().challengeHistory.at(-1)?.status).toBe(result);
+      expect(store.startChallenge('power_recovery')).toBe(true);
+    }
+  );
+  it('distinguishes identical physical batches in a fresh material session', () => {
+    const store = useOperationsCampaignStore.getState();
+    const second = { ...shippingManifest, id: 'shipping-new-session' };
+    const batch = { ...flourBatch, dispatchManifestIds: [shippingManifest.id, second.id] };
+    store.tickCampaign(
+      60,
+      context({
+        materialSessionId: 'session-a',
+        manifests: [shippingManifest],
+        productionBatches: [batch],
+      })
+    );
+    store.tickCampaign(
+      60,
+      context({ materialSessionId: 'session-a', manifests: [second], productionBatches: [batch] })
+    );
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(5000);
+    const third = shippingManifest;
+    store.tickCampaign(
+      60,
+      context({
+        materialSessionId: 'session-b',
+        manifests: [third],
+        productionBatches: [{ ...flourBatch, dispatchManifestIds: [third.id] }],
+      })
+    );
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(6000);
+    expect(useOperationsCampaignStore.getState().orders[2].shippedKg).toBe(4000);
+  });
+  it('does not re-credit a partially shipped batch after same-session rehydration', async () => {
+    const partialManifest: MaterialManifest = {
+      ...shippingManifest,
+      actualKg: 100,
+      materials: [{ type: 'flour', amount: 100 }],
+      sourceLots: [{ lotId: 'lot-0001', amount: 100, path: ['silo-0', 'packer-0'] }],
+      productBatches: [{ batchId: flourBatch.id, amount: 100 }],
+    };
+    const partialBatch: ProductionBatch = {
+      ...flourBatch,
+      availableKg: 4900,
+      disposition: 'released',
+      dispositionReason: null,
+    };
+    const live = context({
+      materialSessionId: 'same-physical-session',
+      manifests: [partialManifest],
+      productionBatches: [partialBatch],
+    });
+    useOperationsCampaignStore.getState().tickCampaign(60, live);
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(100);
+    await useOperationsCampaignStore.persist.rehydrate();
+    useOperationsCampaignStore.getState().tickCampaign(60, live);
+    expect(useOperationsCampaignStore.getState().orders[0].shippedKg).toBe(100);
+  });
+
+  it('retains every receipt still present in a long physical manifest window', () => {
+    const manifests: MaterialManifest[] = Array.from(
+      { length: MAX_MATERIAL_MANIFESTS },
+      (_, index) => ({
+        ...shippingManifest,
+        id: `shipping-window-${index}`,
+        actualKg: 50,
+        materials: [{ type: 'flour', amount: 50 }],
+        sourceLots: [{ lotId: 'lot-0001', amount: 50, path: ['silo-0', 'packer-0'] }],
+        productBatches: [{ batchId: `batch-window-${index}`, amount: 50 }],
+      })
+    );
+    const batches: ProductionBatch[] = manifests.map((manifest, index) => ({
+      ...flourBatch,
+      id: `batch-window-${index}`,
+      producedKg: 1000,
+      availableKg: 950,
+      sourceContributions: [{ lotId: 'lot-0001', amount: 1000, path: ['silo-0', 'packer-0'] }],
+      disposition: 'released',
+      dispositionReason: null,
+      dispatchManifestIds: [manifest.id],
+    }));
+    const live = context({
+      materialSessionId: 'long-physical-session',
+      manifests,
+      productionBatches: batches,
+    });
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(60, live);
+    store.tickCampaign(60, live);
+    expect(
+      useOperationsCampaignStore.getState().orders.reduce((sum, order) => sum + order.shippedKg, 0)
+    ).toBe(MAX_MATERIAL_MANIFESTS * 50);
+  });
+  it('preserves cumulative waste cost across same-session rehydration', async () => {
+    const live = context({ materialSessionId: 'same-waste-session', wasteKg: 10 });
+    useOperationsCampaignStore.getState().tickCampaign(60, live);
+    expect(useOperationsCampaignStore.getState().economics.wasteCost).toBeCloseTo(1.8);
+    await useOperationsCampaignStore.persist.rehydrate();
+    useOperationsCampaignStore.getState().tickCampaign(60, live);
+    expect(useOperationsCampaignStore.getState().economics.wasteCost).toBeCloseTo(1.8);
+  });
+
+  it('counts all fresh-session waste even when its counter exceeds the previous session', () => {
+    const store = useOperationsCampaignStore.getState();
+    store.tickCampaign(60, context({ materialSessionId: 'waste-session-a', wasteKg: 10 }));
+    store.tickCampaign(60, context({ materialSessionId: 'waste-session-b', wasteKg: 20 }));
+    expect(useOperationsCampaignStore.getState().economics.wasteCost).toBeCloseTo(5.4);
+  });
+});
+
+describe('compact batch credit keys', () => {
+  beforeEach(() => useOperationsCampaignStore.getState().resetCampaign());
+  const legacyKey = (sessionId: string | null, batch: ProductionBatch) =>
+    JSON.stringify([
+      sessionId,
+      batch.id,
+      batch.simulationTime,
+      batch.materialType,
+      batch.producedKg,
+      batch.sourceContributions,
+    ]);
+  const shipped = () =>
+    useOperationsCampaignStore.getState().orders.reduce((sum, order) => sum + order.shippedKg, 0);
+
+  it('keys credit by a short digest instead of the whole source-contribution list', () => {
+    const sourceContributions = Array.from({ length: 40 }, (_, i) => ({
+      lotId: `lot-${i}`,
+      amount: 125,
+      path: ['silo-0', 'sifter-a', 'packer-0'],
+    }));
+    useOperationsCampaignStore.getState().tickCampaign(
+      60,
+      context({
+        materialSessionId: 'compact-session',
+        manifests: [shippingManifest],
+        productionBatches: [{ ...flourBatch, sourceContributions }],
+      })
+    );
+    const keys = Object.keys(useOperationsCampaignStore.getState().creditedBatchKg);
+    expect(keys).toHaveLength(1);
+    expect(keys[0].length).toBeLessThan(160);
+    expect(keys[0]).not.toContain('lot-');
+    expect(shipped()).toBe(5000);
+  });
+
+  it('honours credit recorded under the legacy key format and replaces that key', () => {
+    useOperationsCampaignStore.setState({
+      creditedBatchKg: { [legacyKey('legacy-session', flourBatch)]: 4900 },
+      lastMaterialSessionId: 'legacy-session',
+    });
+    const next = { ...shippingManifest, id: 'shipping-after-upgrade' };
+    useOperationsCampaignStore.getState().tickCampaign(
+      60,
+      context({
+        materialSessionId: 'legacy-session',
+        manifests: [next],
+        productionBatches: [{ ...flourBatch, dispatchManifestIds: [next.id] }],
+      })
+    );
+    expect(shipped()).toBe(100);
+    const credited = useOperationsCampaignStore.getState().creditedBatchKg;
+    expect(Object.values(credited)).toEqual([5000]);
+    expect(Object.keys(credited)[0]).not.toContain('lot-');
+  });
+
+  it('compacts legacy keys when a saved campaign is restored, without re-crediting', () => {
+    const options = useOperationsCampaignStore.persist.getOptions();
+    const merged = options.merge!(
+      {
+        creditedBatchKg: { [legacyKey('legacy-session', flourBatch)]: 4900 },
+        lastMaterialSessionId: 'legacy-session',
+      },
+      useOperationsCampaignStore.getState()
+    );
+    expect(Object.keys(merged.creditedBatchKg)).toHaveLength(1);
+    expect(Object.keys(merged.creditedBatchKg)[0]).not.toContain('lot-');
+    useOperationsCampaignStore.setState(merged);
+    const next = { ...shippingManifest, id: 'shipping-after-restore' };
+    useOperationsCampaignStore.getState().tickCampaign(
+      60,
+      context({
+        materialSessionId: 'legacy-session',
+        manifests: [next],
+        productionBatches: [{ ...flourBatch, dispatchManifestIds: [next.id] }],
+      })
+    );
+    expect(shipped()).toBe(100);
+  });
+
+  // The credit record keeps the newest 1,000 batch keys. A 90-minute shift
+  // packs about 15 batches (UnifiedGameTick.workplace replay evidence), so a
+  // campaign passes the cap after roughly four to five game days: about an
+  // hour of play at 4x. Eviction is safe because the record is only ever the
+  // second guard: a manifest is counted once by its id (the receipt window
+  // spans the whole manifest window), and a dispatch only removes mass that
+  // is still available, so a resident batch's later credit is bounded by its
+  // own manifest line rather than by the evicted total.
+  it('neither double-credits nor drops credit after the record passes 1,000 batches and reloads', () => {
+    const sessionId = 'long-campaign-session';
+    const path = ['silo-0', 'packer-0'];
+    const line = (id: string, batches: { batchId: string; amount: number }[]): MaterialManifest => {
+      const kg = batches.reduce((sum, batch) => sum + batch.amount, 0);
+      return {
+        ...shippingManifest,
+        id,
+        requestedKg: kg,
+        actualKg: kg,
+        materials: [{ type: 'flour', amount: kg }],
+        sourceLots: [{ lotId: 'lot-0001', amount: kg, path }],
+        productBatches: batches,
+      };
+    };
+    // A batch that stays in stock after its first 100 kg ships.
+    const resident: ProductionBatch = {
+      ...flourBatch,
+      id: 'batch-resident',
+      producedKg: 1000,
+      availableKg: 900,
+      sourceContributions: [{ lotId: 'lot-0001', amount: 1000, path }],
+      disposition: 'released',
+      dispositionReason: null,
+      dispatchManifestIds: ['shipping-resident-1'],
+    };
+    const store = useOperationsCampaignStore.getState();
+    const manifests: MaterialManifest[] = [
+      line('shipping-resident-1', [{ batchId: resident.id, amount: 100 }]),
+    ];
+    const shippedBatches: ProductionBatch[] = [];
+    const live = () =>
+      context({
+        materialSessionId: sessionId,
+        manifests: manifests.slice(-MAX_MATERIAL_MANIFESTS),
+        productionBatches: [resident, ...shippedBatches.slice(-32)],
+      });
+    store.tickCampaign(60, live());
+    // 40 later trucks of 25 one-kilogram batches: 1,000 newer credit keys.
+    for (let truck = 0; truck < 40; truck++) {
+      const id = `shipping-fill-${truck}`;
+      const batches = Array.from({ length: 25 }, (_, index) => ({
+        ...flourBatch,
+        id: `batch-fill-${truck}-${index}`,
+        producedKg: 1,
+        sourceContributions: [{ lotId: 'lot-0001', amount: 1, path }],
+        dispatchManifestIds: [id],
+      }));
+      shippedBatches.push(...batches);
+      manifests.push(
+        line(
+          id,
+          batches.map((batch) => ({ batchId: batch.id, amount: 1 }))
+        )
+      );
+      store.tickCampaign(60, live());
+    }
+    const credited = useOperationsCampaignStore.getState().creditedBatchKg;
+    expect(Object.keys(credited)).toHaveLength(1000);
+    expect(Object.keys(credited).some((key) => key.includes(resident.id))).toBe(false);
+    expect(shipped()).toBe(1100);
+
+    // Reload the saved campaign against the same physical window.
+    const options = useOperationsCampaignStore.persist.getOptions();
+    const saved = JSON.parse(
+      JSON.stringify(options.partialize!(useOperationsCampaignStore.getState()))
+    );
+    store.resetCampaign();
+    useOperationsCampaignStore.setState(
+      options.merge!(saved, useOperationsCampaignStore.getState())
+    );
+    store.tickCampaign(60, live());
+    expect(shipped()).toBe(1100);
+
+    // The resident batch ships its remaining 900 kg: credited once, in full.
+    resident.availableKg = 0;
+    resident.disposition = 'shipped';
+    resident.dispatchManifestIds.push('shipping-resident-2');
+    manifests.push(line('shipping-resident-2', [{ batchId: resident.id, amount: 900 }]));
+    store.tickCampaign(60, live());
+    store.tickCampaign(60, live());
+    expect(shipped()).toBe(2000);
+  });
+});

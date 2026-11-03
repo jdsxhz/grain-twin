@@ -1,0 +1,293 @@
+/**
+ * Energy Calculations Utility
+ *
+ * Shared instantaneous power-demand models for the factory simulation.
+ * Used by EnergyDashboard and the unified game tick (campaign energy cost).
+ */
+
+import { MachineType, MachineData } from '../types';
+import { translate } from '../i18n';
+import { energyCalculationsMessages as messages } from './energyCalculations.messages';
+
+/**
+ * Electrical demand by machine type (kW).
+ * Running = full operation, Idle = standby demand.
+ */
+export const MACHINE_ENERGY_CONSUMPTION: Record<MachineType, { running: number; idle: number }> = {
+  [MachineType.SILO]: { running: 2, idle: 0.5 },
+  [MachineType.ROLLER_MILL]: { running: 45, idle: 2 },
+  [MachineType.PLANSIFTER]: { running: 25, idle: 1.5 },
+  [MachineType.PACKER]: { running: 15, idle: 1 },
+  [MachineType.CONTROL_ROOM]: { running: 5, idle: 5 },
+};
+
+const MACHINE_TYPE_LABEL_KEYS = {
+  [MachineType.SILO]: 'typeSilo',
+  [MachineType.ROLLER_MILL]: 'typeRollerMill',
+  [MachineType.PLANSIFTER]: 'typePlansifter',
+  [MachineType.PACKER]: 'typePacker',
+  [MachineType.CONTROL_ROOM]: 'typeControlRoom',
+} as const satisfies Record<MachineType, keyof typeof messages.en>;
+
+/**
+ * Machine type display names for UI. Each entry is a getter, so a read
+ * resolves in the language active at that moment rather than at import.
+ */
+export const MACHINE_TYPE_LABELS = {} as Record<MachineType, string>;
+for (const type of Object.values(MachineType)) {
+  Object.defineProperty(MACHINE_TYPE_LABELS, type, {
+    enumerable: true,
+    get: () => translate(messages, MACHINE_TYPE_LABEL_KEYS[type]),
+  });
+}
+
+export interface MachineEnergyBreakdown {
+  baseEnergy: number;
+  loadFactor: number;
+  warningPenalty: number;
+  maintenancePenalty: number;
+  finalEnergy: number;
+}
+
+/**
+ * Calculate instantaneous power demand for a machine based on its current state.
+ * Includes load factor, warning status, and maintenance penalties.
+ */
+export function getMachineEnergy(machine: MachineData): number {
+  return getMachineEnergyDetailed(machine).finalEnergy;
+}
+
+/**
+ * Get a detailed demand breakdown for a machine including all modifiers.
+ */
+export function getMachineEnergyDetailed(machine: MachineData): MachineEnergyBreakdown {
+  const consumption = MACHINE_ENERGY_CONSUMPTION[machine.type] || { running: 20, idle: 1 };
+
+  // Maintenance penalty calculation
+  // 0 or negative = overdue, uses 25% more energy
+  // 0-24 hours = soon due, uses 5-25% more energy (linear)
+  // >24 hours = well maintained, normal energy
+  let maintenancePenalty = 1.0;
+  if (machine.maintenanceCountdown !== undefined) {
+    if (machine.maintenanceCountdown <= 0) {
+      maintenancePenalty = 1.25; // 25% penalty when overdue
+    } else if (machine.maintenanceCountdown < 24) {
+      // Linear interpolation from 5% to 25% penalty as maintenance becomes due
+      maintenancePenalty = 1.05 + (1 - machine.maintenanceCountdown / 24) * 0.2;
+    }
+  }
+
+  // A non-finite load must not poison the campaign's energy cost with NaN.
+  const rawLoad = machine.metrics.load;
+  const load = Number.isFinite(rawLoad) ? Math.min(100, Math.max(0, rawLoad)) : 0;
+
+  let baseEnergy: number;
+  let loadFactor = 1.0;
+  let warningPenalty = 1.0;
+
+  switch (machine.status) {
+    case 'running':
+      // Running machines factor in load - 70-100% based on load
+      loadFactor = 0.7 + (load / 100) * 0.3;
+      baseEnergy = consumption.running * loadFactor;
+      break;
+    case 'warning':
+      // Running but inefficient: the same load curve, +10% on top.
+      loadFactor = 0.7 + (load / 100) * 0.3;
+      warningPenalty = 1.1;
+      baseEnergy = consumption.running * loadFactor * warningPenalty;
+      break;
+    case 'critical':
+      // Critical - still consuming but erratically
+      baseEnergy = consumption.running * 0.8;
+      break;
+    case 'idle':
+    default:
+      baseEnergy = consumption.idle;
+      break;
+  }
+
+  // Apply maintenance penalty (only affects running machines)
+  const finalEnergy = machine.status === 'idle' ? baseEnergy : baseEnergy * maintenancePenalty;
+
+  return {
+    baseEnergy: consumption.running,
+    loadFactor,
+    warningPenalty,
+    maintenancePenalty,
+    finalEnergy,
+  };
+}
+
+export interface FacilityBaseLoad {
+  lighting: number;
+  hvac: number;
+  other: number;
+  total: number;
+  timeDescription: string;
+}
+
+/**
+ * Calculate base facility load based on time of day.
+ *
+ * Lighting: 8 kW day to 35 kW night (dawn/dusk transitions 6-8am, 5-7pm)
+ * HVAC: 20 kW night to 30 kW morning to 45 kW afternoon peak to 35 kW evening
+ * Other: 15 kW constant (security, IT, fire systems)
+ */
+export function getFacilityBaseLoad(gameTime: number): FacilityBaseLoad {
+  // Normalize hour to 0-24
+  const hour = ((gameTime % 24) + 24) % 24;
+
+  // Lighting: Full power at night, reduced during day
+  let lighting: number;
+  let lightingDesc: string;
+
+  if (hour >= 8 && hour < 17) {
+    lighting = 8;
+    lightingDesc = translate(messages, 'lightingDay');
+  } else if (hour >= 6 && hour < 8) {
+    const progress = (hour - 6) / 2;
+    lighting = 35 - progress * 27;
+    lightingDesc = translate(messages, 'lightingDawn');
+  } else if (hour >= 17 && hour < 19) {
+    const progress = (hour - 17) / 2;
+    lighting = 8 + progress * 27;
+    lightingDesc = translate(messages, 'lightingDusk');
+  } else {
+    lighting = 35;
+    lightingDesc = translate(messages, 'lightingNight');
+  }
+
+  // HVAC: Temperature-based load curve
+  let hvac: number;
+  let hvacDesc: string;
+
+  if (hour >= 10 && hour < 16) {
+    hvac = 45;
+    hvacDesc = translate(messages, 'hvacAfternoon');
+  } else if (hour >= 6 && hour < 10) {
+    hvac = 30;
+    hvacDesc = translate(messages, 'hvacMorning');
+  } else if (hour >= 16 && hour < 22) {
+    hvac = 35;
+    hvacDesc = translate(messages, 'hvacEvening');
+  } else {
+    hvac = 20;
+    hvacDesc = translate(messages, 'hvacNight');
+  }
+
+  // Other: Constant base systems
+  const other = 15;
+
+  return {
+    lighting,
+    hvac,
+    other,
+    total: lighting + hvac + other,
+    timeDescription: translate(messages, 'timeDescription', {
+      lighting: lightingDesc,
+      hvac: hvacDesc,
+    }),
+  };
+}
+
+export interface EmergencyLoad {
+  lighting: number;
+  hvac: number;
+  baseSystems: number;
+  total: number;
+}
+
+/**
+ * Calculate emergency-mode electrical demand.
+ * Only 30% lighting + 50% HVAC + base systems (approximately 42-53 kW).
+ */
+export function getEmergencyLoad(baseLoad: FacilityBaseLoad): EmergencyLoad {
+  const lighting = baseLoad.lighting * 0.3;
+  const hvac = baseLoad.hvac * 0.5;
+  const baseSystems = baseLoad.other + 10; // Extra for emergency systems
+
+  return {
+    lighting,
+    hvac,
+    baseSystems,
+    total: Math.round(lighting + hvac + baseSystems),
+  };
+}
+
+/**
+ * Whole-site electrical demand (kW): the single figure the energy dashboard
+ * shows and the operations campaign bills. During an emergency the machines are
+ * held and the site drops to emergency-mode facility load.
+ */
+export function getSiteDemandKw(
+  machines: MachineData[],
+  gameTime: number,
+  emergencyActive: boolean
+): number {
+  const facility = getFacilityBaseLoad(gameTime);
+  if (emergencyActive) return getEmergencyLoad(facility).total;
+  return machines.reduce((sum, machine) => sum + getMachineEnergy(machine), 0) + facility.total;
+}
+
+export interface MachineTypeEnergyStats {
+  type: MachineType;
+  label: string;
+  runningCount: number;
+  idleCount: number;
+  warningCount: number;
+  overdueCount: number;
+  totalEnergy: number;
+  nominalRunning: number;
+  nominalIdle: number;
+}
+
+/**
+ * Aggregate instantaneous demand statistics by machine type.
+ */
+export function getMachineEnergyByType(machines: MachineData[]): MachineTypeEnergyStats[] {
+  const stats: Map<MachineType, MachineTypeEnergyStats> = new Map();
+
+  // Initialize stats for all machine types
+  for (const type of Object.values(MachineType)) {
+    const consumption = MACHINE_ENERGY_CONSUMPTION[type];
+    if (consumption) {
+      stats.set(type, {
+        type,
+        label: MACHINE_TYPE_LABELS[type],
+        runningCount: 0,
+        idleCount: 0,
+        warningCount: 0,
+        overdueCount: 0,
+        totalEnergy: 0,
+        nominalRunning: consumption.running,
+        nominalIdle: consumption.idle,
+      });
+    }
+  }
+
+  // Aggregate machine data
+  for (const machine of machines) {
+    const stat = stats.get(machine.type);
+    if (stat) {
+      stat.totalEnergy += getMachineEnergy(machine);
+
+      if (machine.status === 'running') {
+        stat.runningCount++;
+      } else if (machine.status === 'warning') {
+        stat.warningCount++;
+      } else {
+        stat.idleCount++;
+      }
+
+      if (machine.maintenanceCountdown !== undefined && machine.maintenanceCountdown <= 0) {
+        stat.overdueCount++;
+      }
+    }
+  }
+
+  // Filter to only types with machines and sort by electrical demand.
+  return Array.from(stats.values())
+    .filter((s) => s.runningCount + s.idleCount + s.warningCount > 0)
+    .sort((a, b) => b.totalEnergy - a.totalEnergy);
+}
